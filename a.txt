@@ -1,2 +1,23 @@
 groq api (leagal_ai):
 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
+
+
+<-- Project Structure -->
+
+legal-rag/
+│
+├── data/
+├── faiss_index/
+├── app.py
+├── ingest.py
+└── requirements.txt
+
+mkdir legal-rag
+cd legal-rag 
+
+mkdir data
+mkdir faiss_index
+
+touch app.py
+touch ingest.py
+touch requirements.txt
