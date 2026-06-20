@@ -27,29 +27,6 @@ API_TOKEN = os.getenv("API_TOKEN", "")
 
 AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
-
-def check_api_token() -> None:
-    """Verify the API_TOKEN is valid against the external API before starting."""
-    if not API_TOKEN:
-        raise RuntimeError("API_TOKEN is not set in .env")
-    try:
-        resp = requests.get(
-            f"{API_BASE_URL}/api/v1/nodes/leaf",
-            headers=AUTH_HEADERS,
-            timeout=10,
-        )
-        if resp.status_code == 401:
-            raise RuntimeError(f"API_TOKEN is invalid — got 401 from {API_BASE_URL}")
-        resp.raise_for_status()
-        print(f"API token verified successfully against {API_BASE_URL}")
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Could not reach API to verify token: {e}")
-
-
-check_api_token()
-
 check_api_token()
 
 app = FastAPI()
