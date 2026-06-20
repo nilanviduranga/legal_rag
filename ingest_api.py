@@ -15,10 +15,11 @@ CHUNKS_PATH = f"{INDEX_DIR}/chunks.pkl"
 BM25_CORPUS_PATH = f"{INDEX_DIR}/bm25_corpus.pkl"
 
 
-def build_index(api_base_url: str, embedder: SentenceTransformer) -> dict:
+def build_index(api_base_url: str, embedder: SentenceTransformer, auth_headers: dict | None = None) -> dict:
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    headers = auth_headers or {}
 
-    response = requests.get(f"{api_base_url}/api/v1/nodes/leaf")
+    response = requests.get(f"{api_base_url}/api/v1/nodes/leaf", headers=headers)
     response.raise_for_status()
     leaf_nodes = response.json()
     print(f"Found {len(leaf_nodes)} leaf nodes")
@@ -27,7 +28,7 @@ def build_index(api_base_url: str, embedder: SentenceTransformer) -> dict:
     for node in leaf_nodes:
         node_id = node["node_id"]
         print(f"Processing node {node_id}...")
-        law_resp = requests.get(f"{api_base_url}/api/v1/nodes/{node_id}/law-path")
+        law_resp = requests.get(f"{api_base_url}/api/v1/nodes/{node_id}/law-path", headers=headers)
         law_resp.raise_for_status()
         law_text = law_resp.json()["law_text"]
         header = f"[Node ID: {node_id}]"
@@ -59,5 +60,7 @@ def build_index(api_base_url: str, embedder: SentenceTransformer) -> dict:
 
 if __name__ == "__main__":
     api_base = os.getenv("API_BASE_URL", "http://localhost/").rstrip("/")
+    token = os.getenv("API_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-    build_index(api_base, model)
+    build_index(api_base, model, auth_headers=headers)

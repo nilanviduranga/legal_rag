@@ -18,6 +18,32 @@ load_dotenv()
 app = FastAPI()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
+API_TOKEN = os.getenv("API_TOKEN", "")
+
+AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+
+
+def check_api_token() -> None:
+    """Verify the API_TOKEN is valid against the external API before starting."""
+    if not API_TOKEN:
+        raise RuntimeError("API_TOKEN is not set in .env")
+    try:
+        resp = requests.get(
+            f"{API_BASE_URL}/api/v1/nodes/leaf",
+            headers=AUTH_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            raise RuntimeError(f"API_TOKEN is invalid — got 401 from {API_BASE_URL}")
+        resp.raise_for_status()
+        print(f"API token verified successfully against {API_BASE_URL}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Could not reach API to verify token: {e}")
+
+
+check_api_token()
 
 CANDIDATE_K = 10
 TOP_K = 3
@@ -64,7 +90,7 @@ def chunk_node_id(c):
 def fetch_full_law(node_id: str) -> str:
     try:
         url = f"{API_BASE_URL}/api/v1/nodes/{node_id}/law-path"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, headers=AUTH_HEADERS, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         return data.get("content") or data.get("text") or data.get("law") or str(data)
@@ -119,6 +145,6 @@ def rebuild_vectordb():
         if os.path.exists(path):
             os.remove(path)
     store.clear()
-    result = build_index(API_BASE_URL, embedder)
+    result = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
     load_store()
     return {"status": "rebuilt", **result}
