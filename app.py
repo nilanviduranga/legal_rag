@@ -1,23 +1,28 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from llm import generate_answer
-from ingest_api import build_index, INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH
-
-import faiss
-import pickle
-import numpy as np
 import os
-import requests
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from rank_bm25 import BM25Okapi
-from dotenv import load_dotenv
-
-load_dotenv()
-
-app = FastAPI()
-
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
+from config import API_BASE_URL, AUTH_HEADERS, SUMMARIZE_THRESHOLD, INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH
+from search import embedder, store, load_store, require_store, hybrid_search, chunk_node_id
+from client import (
+    check_api_token,
+    fetch_full_law,
+    create_session,
+    update_session_title,
+    store_chat,
+    get_chats,
+    clear_chats,
+    fetch_chat_count,
+    fetch_session_summary,
+    fetch_unsummarized_chats,
+    update_session_summary,
+    mark_chats_summarized,
+    get_history,
+    run_summarize_job,
+)
+from llm import generate_answer
+from ingest import build_index
 API_TOKEN = os.getenv("API_TOKEN", "")
 
 AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -45,31 +50,9 @@ def check_api_token() -> None:
 
 check_api_token()
 
-CANDIDATE_K = 10
-TOP_K = 3
+check_api_token()
 
-embedder = SentenceTransformer("BAAI/bge-base-en-v1.5")
-reranker = CrossEncoder("BAAI/bge-reranker-base")
-
-# Mutable store so indexes can be hot-reloaded without restarting the server
-store: dict = {}
-
-
-def load_store() -> None:
-    store["index"] = faiss.read_index(INDEX_PATH)
-    with open(CHUNKS_PATH, "rb") as f:
-        store["chunks"] = pickle.load(f)
-    with open(BM25_CORPUS_PATH, "rb") as f:
-        store["bm25"] = BM25Okapi(pickle.load(f))
-
-
-def require_store() -> None:
-    if not store:
-        raise HTTPException(
-            status_code=503,
-            detail="Vector DB not ready. Call POST /vectordb/rebuild first.",
-        )
-
+app = FastAPI()
 
 if os.path.exists(INDEX_PATH):
     load_store()
@@ -79,65 +62,135 @@ class Question(BaseModel):
     question: str
 
 
-def chunk_text(c) -> str:
-    return c["text"] if isinstance(c, dict) else c
+class SessionCreate(BaseModel):
+    user_id: str
+    title: Optional[str] = None
 
 
-def chunk_node_id(c):
-    return c.get("node_id") if isinstance(c, dict) else None
+class TitleUpdate(BaseModel):
+    title: str
 
 
-def fetch_full_law(node_id: str) -> str:
-    try:
-        url = f"{API_BASE_URL}/api/v1/nodes/{node_id}/law-path"
-        resp = requests.get(url, headers=AUTH_HEADERS, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("content") or data.get("text") or data.get("law") or str(data)
-    except Exception:
-        return ""
+class ChatCreate(BaseModel):
+    user_message: str
+    ai_response: str
 
 
-def hybrid_search(query: str) -> list:
-    query_vec = embedder.encode([query])
-    _, faiss_indices = store["index"].search(np.array(query_vec), CANDIDATE_K)
-    semantic_hits = set(faiss_indices[0].tolist())
-
-    tokens = query.lower().split()
-    bm25_scores = store["bm25"].get_scores(tokens)
-    bm25_top = np.argsort(bm25_scores)[::-1][:CANDIDATE_K].tolist()
-    keyword_hits = set(bm25_top)
-
-    candidate_indices = list(semantic_hits | keyword_hits)
-    candidates = [store["chunks"][i] for i in candidate_indices]
-
-    pairs = [(query, chunk_text(c)) for c in candidates]
-    scores = reranker.predict(pairs)
-    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-
-    return [c for _, c in ranked[:TOP_K]]
+class SummaryUpdate(BaseModel):
+    summary: str
 
 
-@app.post("/ask")
-def ask(question: Question):
-    require_store()
-    matched = hybrid_search(question.question)
+class MarkSummarized(BaseModel):
+    chat_ids: list[int]
 
-    full_laws = []
+
+def _resolve_laws(matched: list) -> list[str]:
+    laws = []
     for c in matched:
-        node_id = chunk_node_id(c)
-        if node_id:
-            law_text = fetch_full_law(node_id)
-            if law_text:
-                full_laws.append(law_text)
+        nid = chunk_node_id(c)
+        if nid:
+            law = fetch_full_law(nid)
+            if law:
+                laws.append(law)
+    return laws
 
-    answer = generate_answer(question.question, full_laws=full_laws)
 
-    return {
-        "answer": answer,
-        "full_laws": full_laws,
-    }
+# ── Session management ──────────────────────────────────────────────────────
 
+@app.post("/sessions")
+def create_session_endpoint(body: SessionCreate):
+    result = create_session(body.model_dump(exclude_none=True))
+    if not result:
+        raise HTTPException(status_code=502, detail="Failed to create session")
+    return result
+
+
+@app.patch("/sessions/{session_id}/title")
+def update_title(session_id: str, body: TitleUpdate):
+    result = update_session_title(session_id, body.title)
+    return result
+
+
+# ── AI ask ──────────────────────────────────────────────────────────────────
+
+@app.post("/sessions/{session_id}/ask")
+def session_ask(session_id: str, question: Question, background_tasks: BackgroundTasks):
+    require_store()
+    summary = fetch_session_summary(session_id)
+    recent_chats = fetch_unsummarized_chats(session_id)
+
+    matched = hybrid_search(question.question)
+    full_laws = _resolve_laws(matched)
+    answer = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
+
+    store_chat(session_id, question.question, answer)
+
+    count = fetch_chat_count(session_id)
+    if count is not None and count >= SUMMARIZE_THRESHOLD:
+        background_tasks.add_task(run_summarize_job, session_id)
+
+    return {"answer": answer, "full_laws": full_laws}
+
+
+# ── Chat CRUD ───────────────────────────────────────────────────────────────
+
+@app.post("/sessions/{session_id}/chats")
+def create_chat(session_id: str, body: ChatCreate):
+    store_chat(session_id, body.user_message, body.ai_response)
+    return {"status": "created"}
+
+
+@app.get("/sessions/{session_id}/chats")
+def list_chats(session_id: str):
+    chats = get_chats(session_id)
+    return {"session_id": session_id, "chats": chats}
+
+
+@app.delete("/sessions/{session_id}/chats")
+def delete_chats(session_id: str):
+    clear_chats(session_id)
+    return {"status": "cleared"}
+
+
+@app.get("/sessions/{session_id}/count")
+def session_chat_count(session_id: str):
+    count = fetch_chat_count(session_id)
+    if count is None:
+        raise HTTPException(status_code=502, detail="Failed to fetch chat count")
+    return {"session_id": session_id, "count": count}
+
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+
+@app.get("/sessions/{session_id}/summary")
+def get_summary(session_id: str):
+    summary = fetch_session_summary(session_id)
+    return {"session_id": session_id, "summary": summary}
+
+
+@app.patch("/sessions/{session_id}/summary")
+def patch_summary(session_id: str, body: SummaryUpdate):
+    update_session_summary(session_id, body.summary)
+    return {"status": "updated"}
+
+
+# ── Mark summarized ─────────────────────────────────────────────────────────
+
+@app.patch("/mark-summarized")
+def mark_summarized(body: MarkSummarized):
+    mark_chats_summarized(body.chat_ids)
+    return {"status": "marked"}
+
+
+# ── History ─────────────────────────────────────────────────────────────────
+
+@app.get("/history/{user_id}")
+def user_history(user_id: str):
+    sessions = get_history(user_id)
+    return {"user_id": user_id, "sessions": sessions}
+
+
+# ── Admin ────────────────────────────────────────────────────────────────────
 
 @app.post("/vectordb/rebuild")
 def rebuild_vectordb():

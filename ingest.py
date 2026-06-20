@@ -1,31 +1,52 @@
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-import faiss
+import os
 import pickle
 import numpy as np
+import faiss
+import requests
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
 
-reader = PdfReader("data/consumer_protection.pdf")
-text = "".join(page.extract_text() + "\n" for page in reader.pages)
+from config import INDEX_DIR, INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH, API_BASE_URL, AUTH_HEADERS
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-chunks = splitter.split_text(text)
-print(f"Created {len(chunks)} chunks")
 
-model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-embeddings = model.encode(chunks, show_progress_bar=True)
+def build_index(api_base_url: str, embedder: SentenceTransformer, auth_headers: dict | None = None) -> dict:
+    headers = auth_headers or {}
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
 
-dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
-index.add(np.array(embeddings))
+    resp = requests.get(f"{api_base_url}/api/v1/nodes/leaf", headers=headers)
+    resp.raise_for_status()
+    leaf_nodes = resp.json()
+    print(f"Found {len(leaf_nodes)} leaf nodes")
 
-faiss.write_index(index, "faiss_index/legal.index")
+    all_chunks = []
+    for node in leaf_nodes:
+        node_id = node["node_id"]
+        law_resp = requests.get(f"{api_base_url}/api/v1/nodes/{node_id}/law-path", headers=headers)
+        law_resp.raise_for_status()
+        law_text = law_resp.json()["law_text"]
+        for chunk in splitter.split_text(law_text):
+            all_chunks.append({"text": f"[Node ID: {node_id}]\n\n{chunk}", "node_id": node_id})
 
-with open("faiss_index/chunks.pkl", "wb") as f:
-    pickle.dump(chunks, f)
+    print(f"Total chunks: {len(all_chunks)}")
 
-bm25_corpus = [chunk.lower().split() for chunk in chunks]
-with open("faiss_index/bm25_corpus.pkl", "wb") as f:
-    pickle.dump(bm25_corpus, f)
+    texts = [c["text"] for c in all_chunks]
+    embeddings = embedder.encode(texts, show_progress_bar=True)
 
-print("Index saved successfully")
+    faiss_index = faiss.IndexFlatL2(embeddings.shape[1])
+    faiss_index.add(np.array(embeddings))
+
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    faiss.write_index(faiss_index, INDEX_PATH)
+
+    with open(CHUNKS_PATH, "wb") as f:
+        pickle.dump(all_chunks, f)
+    with open(BM25_CORPUS_PATH, "wb") as f:
+        pickle.dump([c["text"].lower().split() for c in all_chunks], f)
+
+    print("Index saved")
+    return {"chunks_indexed": len(all_chunks)}
+
+
+if __name__ == "__main__":
+    model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    build_index(API_BASE_URL, model, auth_headers=AUTH_HEADERS)
