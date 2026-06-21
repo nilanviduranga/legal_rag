@@ -8,17 +8,31 @@ client = OpenAI(
 
 _MODEL = "llama-3.1-8b-instant"
 
-
 _SYSTEM_PROMPT = (
-    "You are a precise legal assistant specialising in Sri Lankan Consumer Protection and Labour laws. "
-    "Answer ONLY from the legal context provided. "
-    "If the answer cannot be determined from the provided context, say so explicitly — do not guess or fabricate. "
-    "When citing a legal provision, mention the relevant section or act name. "
+    "You are a precise legal assistant specialising in Sri Lankan Consumer Protection and Labour laws.\n"
+    "Answer ONLY from the legal context provided.\n"
+    "If the answer cannot be determined from the provided context, say so explicitly — do not guess or fabricate.\n\n"
+    "Context blocks are labelled [STATUTE] or [CASE LAW]:\n"
+    "• Lead your answer with the relevant STATUTE provision (the rule).\n"
+    "• Use CASE LAW to show how courts have interpreted or applied that rule in practice.\n"
+    "• Cite the Act name and section for statutes; cite the case name and citation for case law.\n"
     "Be concise and direct."
 )
 
 
-def generate_answer(question: str, full_laws=None, summary=None, recent_chats=None) -> str:
+def _format_block(chunk: dict | str) -> str:
+    if isinstance(chunk, dict) and chunk.get("source") == "caselaw":
+        return chunk.get("text", "")
+    text = chunk.get("text", "") if isinstance(chunk, dict) else chunk
+    return f"[STATUTE]\n{text}"
+
+
+def generate_answer(
+    question: str,
+    full_laws: list | None = None,
+    summary: str | None = None,
+    recent_chats: list | None = None,
+) -> str:
     context_parts = []
 
     if summary:
@@ -32,13 +46,10 @@ def generate_answer(question: str, full_laws=None, summary=None, recent_chats=No
         context_parts.append("[Recent Conversation]\n" + "\n".join(lines))
 
     if full_laws:
-        context_parts.append("[Relevant Legal Provisions]\n" + "\n\n---\n\n".join(full_laws))
+        context_parts.append("[Relevant Legal Context]\n\n---\n\n".join(_format_block(c) for c in full_laws))
 
     user_content = "\n\n".join(context_parts)
-    if user_content:
-        user_content += f"\n\n[Question]\n{question}"
-    else:
-        user_content = f"[Question]\n{question}"
+    user_content += f"\n\n[Question]\n{question}" if user_content else f"[Question]\n{question}"
 
     response = client.chat.completions.create(
         model=_MODEL,
@@ -62,7 +73,7 @@ def generate_summary(old_summary, chats) -> str:
     system = (
         "You are a legal session summariser. Produce a concise factual summary (max 250 words) "
         "that captures the key legal questions asked and the key advice given. "
-        "This will be used as context for future questions — preserve specific legal provisions mentioned."
+        "Preserve specific legal provisions and case citations mentioned."
     )
     user = f"{prior_section}[New Exchanges to include]\n{chats_text}"
 

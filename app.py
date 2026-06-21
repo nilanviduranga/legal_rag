@@ -4,8 +4,16 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
 
-from config import API_BASE_URL, AUTH_HEADERS, SUMMARIZE_THRESHOLD, INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH
-from search import embedder, store, load_store, require_store, hybrid_search, chunk_node_id
+from config import (
+    API_BASE_URL, AUTH_HEADERS, SUMMARIZE_THRESHOLD,
+    INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH,
+    CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH,
+)
+from search import (
+    embedder, store, caselaw_store,
+    load_store, load_caselaw_store, require_store, hybrid_search,
+    chunk_node_id, chunk_case_law_id,
+)
 from client import (
     check_api_token,
     fetch_full_law,
@@ -25,8 +33,9 @@ from client import (
 )
 from llm import generate_answer
 from ingest import build_index
-API_TOKEN = os.getenv("API_TOKEN", "")
+from ingest_caselaw import build_caselaw_index
 
+API_TOKEN = os.getenv("API_TOKEN", "")
 AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
 check_api_token()
@@ -35,6 +44,8 @@ app = FastAPI()
 
 if os.path.exists(INDEX_PATH):
     load_store()
+
+load_caselaw_store()
 
 
 class Question(BaseModel):
@@ -66,35 +77,54 @@ class MarkSummarized(BaseModel):
 _law_executor = ThreadPoolExecutor(max_workers=6)
 
 
-def _resolve_laws(matched: list) -> list[str]:
+def _resolve_laws(matched: list) -> list:
+    """
+    Resolve matched chunks to full context objects.
+    Statute chunks: fetch law_text + cross-references from legal_admin.
+    Case law chunks: return the chunk dict directly (already has all context needed).
+    Returns a mixed list of str (statute) and dict (caselaw) for llm.py formatting.
+    """
+    statute_ids = []
+    caselaw_chunks = []
     seen = set()
-    unique_ids = []
+
     for c in matched:
-        nid = chunk_node_id(c)
-        if nid and nid not in seen:
-            seen.add(nid)
-            unique_ids.append(nid)
+        if isinstance(c, dict) and c.get("source") == "caselaw":
+            key = f"cl_{c.get('case_law_id')}_{c.get('section_type')}"
+            if key not in seen:
+                seen.add(key)
+                caselaw_chunks.append(c)
+        else:
+            nid = chunk_node_id(c)
+            if nid and nid not in seen:
+                seen.add(nid)
+                statute_ids.append(nid)
 
-    if not unique_ids:
-        return []
+    results = []
 
-    futures = {_law_executor.submit(fetch_law_with_context, nid): nid for nid in unique_ids}
-    primary_laws = []
-    ref_laws = []
-    seen_refs = set(seen)  # don't re-add primary nodes as cross-refs
+    # Fetch statute law texts in parallel
+    if statute_ids:
+        futures = {_law_executor.submit(fetch_law_with_context, nid): nid for nid in statute_ids}
+        primary_laws = []
+        ref_laws = []
+        seen_refs = set(seen)
 
-    for future in as_completed(futures):
-        ctx = future.result()
-        if ctx.get("law_text"):
-            primary_laws.append(ctx["law_text"])
-        for ref in ctx.get("cross_references", []):
-            ref_id = str(ref.get("node_id", ""))
-            if ref_id and ref_id not in seen_refs and ref.get("law_text"):
-                seen_refs.add(ref_id)
-                ref_laws.append(ref["law_text"])
+        for future in as_completed(futures):
+            ctx = future.result()
+            if ctx.get("law_text"):
+                primary_laws.append(ctx["law_text"])
+            for ref in ctx.get("cross_references", []):
+                ref_id = str(ref.get("node_id", ""))
+                if ref_id and ref_id not in seen_refs and ref.get("law_text"):
+                    seen_refs.add(ref_id)
+                    ref_laws.append(ref["law_text"])
 
-    # Primary matches first, then cross-referenced supporting provisions
-    return primary_laws + ref_laws
+        results.extend(primary_laws + ref_laws)
+
+    # Case law chunks come after statutes so LLM sees statutes first
+    results.extend(caselaw_chunks)
+
+    return results
 
 
 # ── Session management ──────────────────────────────────────────────────────
@@ -123,13 +153,13 @@ def session_ask(session_id: str, question: Question, background_tasks: Backgroun
     require_store()
 
     f_summary = _io_executor.submit(fetch_session_summary, session_id)
-    f_chats = _io_executor.submit(fetch_unsummarized_chats, session_id)
-    matched = hybrid_search(question.question)
-    summary = f_summary.result()
+    f_chats   = _io_executor.submit(fetch_unsummarized_chats, session_id)
+    matched   = hybrid_search(question.question)
+    summary   = f_summary.result()
     recent_chats = f_chats.result()
 
     full_laws = _resolve_laws(matched)
-    answer = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
+    answer    = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
 
     store_chat(session_id, question.question, answer)
 
@@ -137,7 +167,21 @@ def session_ask(session_id: str, question: Question, background_tasks: Backgroun
     if count is not None and count >= SUMMARIZE_THRESHOLD:
         background_tasks.add_task(run_summarize_job, session_id)
 
-    return {"answer": answer, "full_laws": full_laws}
+    # Serialize caselaw dicts for the response so callers get structured data
+    serialized_laws = []
+    for item in full_laws:
+        if isinstance(item, dict):
+            serialized_laws.append({
+                "source":       "caselaw",
+                "case_name":    item.get("case_name"),
+                "citation":     item.get("citation"),
+                "section_type": item.get("section_type"),
+                "text":         item.get("text", ""),
+            })
+        else:
+            serialized_laws.append({"source": "statute", "text": item})
+
+    return {"answer": answer, "full_laws": serialized_laws}
 
 
 # ── Chat CRUD ───────────────────────────────────────────────────────────────
@@ -202,10 +246,36 @@ def user_history(user_id: str):
 
 @app.post("/vectordb/rebuild")
 def rebuild_vectordb():
-    for path in [INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH]:
+    """Rebuild both statute and case law FAISS indexes from scratch."""
+    for path in [INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH,
+                 CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH]:
         if os.path.exists(path):
             os.remove(path)
     store.clear()
-    result = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
+    caselaw_store.clear()
+
+    statute_result  = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
+    caselaw_result  = build_caselaw_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
+
     load_store()
-    return {"status": "rebuilt", **result}
+    load_caselaw_store()
+
+    return {
+        "status": "rebuilt",
+        "statute_chunks":  statute_result.get("chunks_indexed", 0),
+        "caselaw_chunks":  caselaw_result.get("chunks_indexed", 0),
+    }
+
+
+@app.post("/vectordb/rebuild-caselaws")
+def rebuild_caselaw_vectordb():
+    """Rebuild only the case law index without touching statute index."""
+    for path in [CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+    caselaw_store.clear()
+
+    result = build_caselaw_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
+    load_caselaw_store()
+
+    return {"status": "rebuilt", "caselaw_chunks": result.get("chunks_indexed", 0)}
