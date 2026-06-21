@@ -12,7 +12,7 @@ from config import (
 from search import (
     embedder, store, caselaw_store,
     load_store, load_caselaw_store, require_store, hybrid_search,
-    chunk_node_id, chunk_case_law_id,
+    chunk_node_id,
 )
 from client import (
     check_api_token,
