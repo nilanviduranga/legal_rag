@@ -1,13 +1,25 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import API_BASE_URL, CLIENT_BASE_URL, API_TOKEN, AUTH_HEADERS
 from llm import generate_summary
+
+_session = requests.Session()
+_adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=20,
+    max_retries=Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504]),
+)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
+_session.headers.update(AUTH_HEADERS)
 
 
 def check_api_token() -> None:
     if not API_TOKEN:
         raise RuntimeError("API_TOKEN is not set in .env")
     try:
-        resp = requests.get(f"{API_BASE_URL}/api/v1/nodes/leaf", headers=AUTH_HEADERS, timeout=10)
+        resp = _session.get(f"{API_BASE_URL}/api/v1/nodes/leaf", timeout=10)
         if resp.status_code == 401:
             raise RuntimeError(f"API_TOKEN is invalid — got 401 from {API_BASE_URL}")
         resp.raise_for_status()
@@ -20,9 +32,8 @@ def check_api_token() -> None:
 
 def fetch_full_law(node_id: str) -> str:
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{API_BASE_URL}/api/v1/nodes/{node_id}/law-path",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -34,10 +45,9 @@ def fetch_full_law(node_id: str) -> str:
 
 def create_session(payload: dict) -> dict:
     try:
-        resp = requests.post(
+        resp = _session.post(
             f"{CLIENT_BASE_URL}/api/chat/sessions",
             json=payload,
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -49,10 +59,9 @@ def create_session(payload: dict) -> dict:
 
 def update_session_title(session_id: str, title: str) -> dict:
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/title",
             json={"title": title},
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -64,10 +73,9 @@ def update_session_title(session_id: str, title: str) -> dict:
 
 def store_chat(session_id: str, user_message: str, ai_response: str) -> None:
     try:
-        resp = requests.post(
+        resp = _session.post(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/chats",
             json={"chat_session_id": session_id, "user_message": user_message, "ai_response": ai_response},
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -77,9 +85,8 @@ def store_chat(session_id: str, user_message: str, ai_response: str) -> None:
 
 def get_chats(session_id: str) -> list:
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/chats",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -92,9 +99,8 @@ def get_chats(session_id: str) -> list:
 
 def clear_chats(session_id: str) -> None:
     try:
-        resp = requests.delete(
+        resp = _session.delete(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/chats",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -104,9 +110,8 @@ def clear_chats(session_id: str) -> None:
 
 def fetch_chat_count(session_id: str):
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/count",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -119,9 +124,8 @@ def fetch_chat_count(session_id: str):
 
 def get_history(user_id: str) -> list:
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/history/{user_id}",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -134,9 +138,8 @@ def get_history(user_id: str) -> list:
 
 def fetch_session_summary(session_id: str):
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/summary",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         if resp.status_code == 404:
@@ -151,9 +154,8 @@ def fetch_session_summary(session_id: str):
 
 def fetch_unsummarized_chats(session_id: str) -> list:
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/chats",
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -166,10 +168,9 @@ def fetch_unsummarized_chats(session_id: str) -> list:
 
 def update_session_summary(session_id: str, summary: str) -> None:
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/summary",
             json={"summary": summary},
-            headers=AUTH_HEADERS,
             timeout=15,
         )
         resp.raise_for_status()
@@ -181,10 +182,9 @@ def mark_chats_summarized(chat_ids: list) -> None:
     if not chat_ids:
         return
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{CLIENT_BASE_URL}/api/chat/mark-summarized",
             json={"chat_ids": chat_ids},
-            headers=AUTH_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
