@@ -9,6 +9,7 @@ from search import embedder, store, load_store, require_store, hybrid_search, ch
 from client import (
     check_api_token,
     fetch_full_law,
+    fetch_law_with_context,
     create_session,
     update_session_title,
     store_chat,
@@ -77,13 +78,23 @@ def _resolve_laws(matched: list) -> list[str]:
     if not unique_ids:
         return []
 
-    futures = {_law_executor.submit(fetch_full_law, nid): nid for nid in unique_ids}
-    laws = []
+    futures = {_law_executor.submit(fetch_law_with_context, nid): nid for nid in unique_ids}
+    primary_laws = []
+    ref_laws = []
+    seen_refs = set(seen)  # don't re-add primary nodes as cross-refs
+
     for future in as_completed(futures):
-        law = future.result()
-        if law:
-            laws.append(law)
-    return laws
+        ctx = future.result()
+        if ctx.get("law_text"):
+            primary_laws.append(ctx["law_text"])
+        for ref in ctx.get("cross_references", []):
+            ref_id = str(ref.get("node_id", ""))
+            if ref_id and ref_id not in seen_refs and ref.get("law_text"):
+                seen_refs.add(ref_id)
+                ref_laws.append(ref["law_text"])
+
+    # Primary matches first, then cross-referenced supporting provisions
+    return primary_laws + ref_laws
 
 
 # ── Session management ──────────────────────────────────────────────────────

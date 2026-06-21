@@ -37,10 +37,22 @@ def fetch_full_law(node_id: str) -> str:
             timeout=30,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("content") or data.get("text") or data.get("law") or str(data)
+        return resp.json().get("law_text", "")
     except Exception:
         return ""
+
+
+def fetch_law_with_context(node_id: str) -> dict:
+    """Fetch a node's law_text plus every cross-referenced node's law_text."""
+    try:
+        resp = _session.get(
+            f"{API_BASE_URL}/api/v1/nodes/{node_id}/law-context",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
 
 
 def create_session(payload: dict) -> dict:
