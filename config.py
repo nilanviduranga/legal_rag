@@ -8,9 +8,9 @@ CLIENT_BASE_URL = os.getenv("CLIENT_BASE_URL", "https://ludexora.live").rstrip("
 API_TOKEN = os.getenv("API_TOKEN", "")
 AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
-CANDIDATE_K = 10
+CANDIDATE_K = 20
 TOP_K = 3
-SUMMARIZE_THRESHOLD = 3
+SUMMARIZE_THRESHOLD = 5
 
 INDEX_DIR = "faiss_index"
 INDEX_PATH = f"{INDEX_DIR}/legal.index"

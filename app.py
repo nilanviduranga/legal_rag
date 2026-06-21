@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
@@ -61,14 +62,27 @@ class MarkSummarized(BaseModel):
     chat_ids: list[int]
 
 
+_law_executor = ThreadPoolExecutor(max_workers=6)
+
+
 def _resolve_laws(matched: list) -> list[str]:
-    laws = []
+    seen = set()
+    unique_ids = []
     for c in matched:
         nid = chunk_node_id(c)
-        if nid:
-            law = fetch_full_law(nid)
-            if law:
-                laws.append(law)
+        if nid and nid not in seen:
+            seen.add(nid)
+            unique_ids.append(nid)
+
+    if not unique_ids:
+        return []
+
+    futures = {_law_executor.submit(fetch_full_law, nid): nid for nid in unique_ids}
+    laws = []
+    for future in as_completed(futures):
+        law = future.result()
+        if law:
+            laws.append(law)
     return laws
 
 
@@ -90,13 +104,19 @@ def update_title(session_id: str, body: TitleUpdate):
 
 # ── AI ask ──────────────────────────────────────────────────────────────────
 
+_io_executor = ThreadPoolExecutor(max_workers=4)
+
+
 @app.post("/sessions/{session_id}/ask")
 def session_ask(session_id: str, question: Question, background_tasks: BackgroundTasks):
     require_store()
-    summary = fetch_session_summary(session_id)
-    recent_chats = fetch_unsummarized_chats(session_id)
 
+    f_summary = _io_executor.submit(fetch_session_summary, session_id)
+    f_chats = _io_executor.submit(fetch_unsummarized_chats, session_id)
     matched = hybrid_search(question.question)
+    summary = f_summary.result()
+    recent_chats = f_chats.result()
+
     full_laws = _resolve_laws(matched)
     answer = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
 

@@ -37,9 +37,12 @@ def _chunk_text(c) -> str:
     return c["text"] if isinstance(c, dict) else c
 
 
+_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+
 def hybrid_search(query: str) -> list:
-    query_vec = embedder.encode([query])
-    _, faiss_indices = store["index"].search(np.array(query_vec), CANDIDATE_K)
+    query_vec = embedder.encode([_BGE_QUERY_PREFIX + query], normalize_embeddings=True)
+    _, faiss_indices = store["index"].search(np.array(query_vec, dtype=np.float32), CANDIDATE_K)
     semantic_hits = set(faiss_indices[0].tolist())
 
     bm25_scores = store["bm25"].get_scores(query.lower().split())

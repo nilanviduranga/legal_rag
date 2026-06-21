@@ -30,10 +30,11 @@ def build_index(api_base_url: str, embedder: SentenceTransformer, auth_headers: 
     print(f"Total chunks: {len(all_chunks)}")
 
     texts = [c["text"] for c in all_chunks]
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts, show_progress_bar=True, normalize_embeddings=True)
+    embeddings = np.array(embeddings, dtype=np.float32)
 
-    faiss_index = faiss.IndexFlatL2(embeddings.shape[1])
-    faiss_index.add(np.array(embeddings))
+    faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
+    faiss_index.add(embeddings)
 
     os.makedirs(INDEX_DIR, exist_ok=True)
     faiss.write_index(faiss_index, INDEX_PATH)
