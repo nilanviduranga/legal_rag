@@ -307,31 +307,18 @@ def user_history(user_id: str):
 
 # ── Admin ────────────────────────────────────────────────────────────────────
 
-@app.post("/vectordb/rebuild")
-def rebuild_vectordb():
-    """Rebuild statute + case law FAISS indexes and regenerate act-level metadata."""
-    for path in [INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH,
-                 CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH,
-                 ACT_INDEX_PATH, ACT_RECORDS_PATH]:
+@app.post("/vectordb/rebuild-statutes")
+def rebuild_statutes():
+    """Rebuild only the statute FAISS index. Does not touch case laws or act metadata."""
+    for path in [INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH]:
         if os.path.exists(path):
             os.remove(path)
     store.clear()
-    caselaw_store.clear()
-    act_store.clear()
 
-    statute_result = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS, build_act_metadata=True)
-    caselaw_result = build_caselaw_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
-
+    result = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS, build_act_metadata=False)
     load_store()
-    load_caselaw_store()
-    load_act_store()
 
-    return {
-        "status":         "rebuilt",
-        "statute_chunks": statute_result.get("chunks_indexed", 0),
-        "caselaw_chunks": caselaw_result.get("chunks_indexed", 0),
-        "acts_indexed":   len(act_store.get("records", [])),
-    }
+    return {"status": "rebuilt", "statute_chunks": result.get("chunks_indexed", 0)}
 
 
 @app.post("/vectordb/rebuild-caselaws")
