@@ -8,11 +8,12 @@ from config import (
     API_BASE_URL, AUTH_HEADERS, SUMMARIZE_THRESHOLD,
     INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH,
     CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH,
+    ACT_INDEX_PATH, ACT_RECORDS_PATH,
 )
 from search import (
-    embedder, store, caselaw_store,
-    load_store, load_caselaw_store, require_store, hybrid_search,
-    chunk_node_id,
+    embedder, store, caselaw_store, act_store,
+    load_store, load_caselaw_store, load_act_store, require_store,
+    build_act_store, hybrid_search, chunk_node_id,
 )
 from client import (
     check_api_token,
@@ -30,8 +31,12 @@ from client import (
     mark_chats_summarized,
     get_history,
     run_summarize_job,
+    refresh_act_statistics,
 )
-from llm import generate_answer
+from llm import generate_answer, generate_discovery_answer
+from intent import classify_intent, is_discovery_intent, is_structural_intent
+from discovery import run_discovery
+from legal_structure import run_structural_query, format_structural_answer
 from ingest import build_index
 from ingest_caselaw import build_caselaw_index
 
@@ -46,6 +51,7 @@ if os.path.exists(INDEX_PATH):
     load_store()
 
 load_caselaw_store()
+load_act_store()
 
 
 class Question(BaseModel):
@@ -102,7 +108,6 @@ def _resolve_laws(matched: list) -> list:
 
     results = []
 
-    # Fetch statute law texts in parallel
     if statute_ids:
         futures = {_law_executor.submit(fetch_law_with_context, nid): nid for nid in statute_ids}
         primary_laws = []
@@ -121,9 +126,7 @@ def _resolve_laws(matched: list) -> list:
 
         results.extend(primary_laws + ref_laws)
 
-    # Case law chunks come after statutes so LLM sees statutes first
     results.extend(caselaw_chunks)
-
     return results
 
 
@@ -148,10 +151,72 @@ def update_title(session_id: str, body: TitleUpdate):
 _io_executor = ThreadPoolExecutor(max_workers=4)
 
 
+def _post_answer(session_id: str, user_message: str, answer: str) -> None:
+    """Background: persist chat then trigger summarisation if threshold reached."""
+    store_chat(session_id, user_message, answer)
+    count = fetch_chat_count(session_id)
+    if count is not None and count >= SUMMARIZE_THRESHOLD:
+        run_summarize_job(session_id)
+
+
 @app.post("/sessions/{session_id}/ask")
 def session_ask(session_id: str, question: Question, background_tasks: BackgroundTasks):
     require_store()
 
+    intent = classify_intent(question.question)
+
+    if is_structural_intent(intent):
+        # ── Structural pipeline (count / list WITHIN a named Act) ───────────
+        structural_result = run_structural_query(question.question, intent)
+        answer = format_structural_answer(structural_result)
+
+        background_tasks.add_task(_post_answer, session_id, question.question, answer)
+
+        return {
+            "answer":  answer,
+            "intent":  intent,
+            "full_laws": [
+                {
+                    "source":      "structural",
+                    "type":        "STRUCTURAL_RESULT",
+                    "act_id":      structural_result.act_id,
+                    "act":         structural_result.act_title,
+                    "short_title": structural_result.short_title,
+                    "node_type":   structural_result.node_type,
+                    "count":       structural_result.count,
+                    "message":     structural_result.message,
+                }
+            ] if structural_result.found else [],
+        }
+
+    if is_discovery_intent(intent) and act_store:
+        # ── Discovery pipeline (count / list) ──────────────────────────────
+        discovery_result = run_discovery(question.question, intent)
+        try:
+            answer = generate_discovery_answer(question.question, discovery_result)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"LLM unavailable: {e}")
+
+        background_tasks.add_task(_post_answer, session_id, question.question, answer)
+
+        serialized_acts = [
+            {
+                "source":      "act_discovery",
+                "act_id":      a.act_id,
+                "title":       a.title,
+                "short_title": a.short_title,
+                "summary":     a.summary,
+                "score":       round(a.score, 4),
+            }
+            for a in discovery_result.acts
+        ]
+        return {
+            "answer":    answer,
+            "intent":    intent,
+            "full_laws": serialized_acts,
+        }
+
+    # ── Standard explanation pipeline ──────────────────────────────────────
     f_summary = _io_executor.submit(fetch_session_summary, session_id)
     f_chats   = _io_executor.submit(fetch_unsummarized_chats, session_id)
     matched   = hybrid_search(question.question)
@@ -159,15 +224,13 @@ def session_ask(session_id: str, question: Question, background_tasks: Backgroun
     recent_chats = f_chats.result()
 
     full_laws = _resolve_laws(matched)
-    answer    = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
+    try:
+        answer = generate_answer(question.question, full_laws=full_laws, summary=summary, recent_chats=recent_chats)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"LLM unavailable: {e}")
 
-    store_chat(session_id, question.question, answer)
+    background_tasks.add_task(_post_answer, session_id, question.question, answer)
 
-    count = fetch_chat_count(session_id)
-    if count is not None and count >= SUMMARIZE_THRESHOLD:
-        background_tasks.add_task(run_summarize_job, session_id)
-
-    # Serialize caselaw dicts for the response so callers get structured data
     serialized_laws = []
     for item in full_laws:
         if isinstance(item, dict):
@@ -181,7 +244,7 @@ def session_ask(session_id: str, question: Question, background_tasks: Backgroun
         else:
             serialized_laws.append({"source": "statute", "text": item})
 
-    return {"answer": answer, "full_laws": serialized_laws}
+    return {"answer": answer, "intent": intent, "full_laws": serialized_laws}
 
 
 # ── Chat CRUD ───────────────────────────────────────────────────────────────
@@ -246,30 +309,34 @@ def user_history(user_id: str):
 
 @app.post("/vectordb/rebuild")
 def rebuild_vectordb():
-    """Rebuild both statute and case law FAISS indexes from scratch."""
+    """Rebuild statute + case law FAISS indexes and regenerate act-level metadata."""
     for path in [INDEX_PATH, CHUNKS_PATH, BM25_CORPUS_PATH,
-                 CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH]:
+                 CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH,
+                 ACT_INDEX_PATH, ACT_RECORDS_PATH]:
         if os.path.exists(path):
             os.remove(path)
     store.clear()
     caselaw_store.clear()
+    act_store.clear()
 
-    statute_result  = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
-    caselaw_result  = build_caselaw_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
+    statute_result = build_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS, build_act_metadata=True)
+    caselaw_result = build_caselaw_index(API_BASE_URL, embedder, auth_headers=AUTH_HEADERS)
 
     load_store()
     load_caselaw_store()
+    load_act_store()
 
     return {
-        "status": "rebuilt",
-        "statute_chunks":  statute_result.get("chunks_indexed", 0),
-        "caselaw_chunks":  caselaw_result.get("chunks_indexed", 0),
+        "status":         "rebuilt",
+        "statute_chunks": statute_result.get("chunks_indexed", 0),
+        "caselaw_chunks": caselaw_result.get("chunks_indexed", 0),
+        "acts_indexed":   len(act_store.get("records", [])),
     }
 
 
 @app.post("/vectordb/rebuild-caselaws")
 def rebuild_caselaw_vectordb():
-    """Rebuild only the case law index without touching statute index."""
+    """Rebuild only the case law index without touching statute or act-metadata indexes."""
     for path in [CASELAW_INDEX_PATH, CASELAW_CHUNKS_PATH, CASELAW_BM25_PATH]:
         if os.path.exists(path):
             os.remove(path)
@@ -279,3 +346,55 @@ def rebuild_caselaw_vectordb():
     load_caselaw_store()
 
     return {"status": "rebuilt", "caselaw_chunks": result.get("chunks_indexed", 0)}
+
+
+@app.post("/vectordb/warm-structure-cache")
+def warm_structure_cache():
+    """
+    Trigger legal_admin to (re)compute act_statistics for every active act.
+    Call this after a vectordb rebuild to pre-warm the structural query cache.
+    """
+    from client import search_acts_by_title
+    import requests as _req
+
+    # Fetch all active acts from legal_admin then refresh each
+    try:
+        from config import API_BASE_URL, AUTH_HEADERS as _hdrs
+        resp = _req.get(f"{API_BASE_URL}/api/v1/acts", headers=_hdrs, timeout=30)
+        resp.raise_for_status()
+        acts = resp.json()
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+    refreshed = 0
+    for act in acts:
+        result = refresh_act_statistics(act["act_id"])
+        if result:
+            refreshed += 1
+
+    return {"status": "warmed", "acts_refreshed": refreshed}
+
+
+@app.post("/vectordb/rebuild-act-metadata")
+def rebuild_act_metadata():
+    """
+    Regenerate AI metadata for all acts and rebuild only the act-level FAISS index.
+    Does not touch the statute or case-law indexes.
+    """
+    for path in [ACT_INDEX_PATH, ACT_RECORDS_PATH]:
+        if os.path.exists(path):
+            os.remove(path)
+    act_store.clear()
+
+    from metadata_gen import generate_and_store_all, fetch_all_metadata
+
+    count   = generate_and_store_all(skip_existing=False)
+    records = fetch_all_metadata()
+    build_act_store(records)
+    load_act_store()
+
+    return {
+        "status":          "rebuilt",
+        "acts_generated":  count,
+        "acts_indexed":    len(act_store.get("records", [])),
+    }

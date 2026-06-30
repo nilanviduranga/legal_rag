@@ -88,7 +88,7 @@ def store_chat(session_id: str, user_message: str, ai_response: str) -> None:
         resp = _session.post(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/chats",
             json={"chat_session_id": session_id, "user_message": user_message, "ai_response": ai_response},
-            timeout=30,
+            timeout=(5, 10),
         )
         resp.raise_for_status()
     except Exception as e:
@@ -124,7 +124,7 @@ def fetch_chat_count(session_id: str):
     try:
         resp = _session.get(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/count",
-            timeout=30,
+            timeout=(5, 10),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -183,7 +183,7 @@ def update_session_summary(session_id: str, summary: str) -> None:
         resp = _session.patch(
             f"{CLIENT_BASE_URL}/api/chat/sessions/{session_id}/summary",
             json={"summary": summary},
-            timeout=15,
+            timeout=(5, 10),
         )
         resp.raise_for_status()
     except Exception as e:
@@ -197,11 +197,80 @@ def mark_chats_summarized(chat_ids: list) -> None:
         resp = _session.patch(
             f"{CLIENT_BASE_URL}/api/chat/mark-summarized",
             json={"chat_ids": chat_ids},
-            timeout=30,
+            timeout=(5, 10),
         )
         resp.raise_for_status()
     except Exception as e:
         print(f"[warn] mark_chats_summarized {chat_ids}: {e}")
+
+
+# ── Legal structure API (structural intent queries) ──────────────────────────
+
+def search_acts_by_title(query: str) -> list[dict]:
+    """
+    Search legal_admin for acts whose title or short_title matches query.
+    Returns up to 5 matches ordered by relevance.
+    """
+    try:
+        resp = _session.get(
+            f"{API_BASE_URL}/api/v1/acts/search",
+            params={"q": query},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[warn] search_acts_by_title '{query}': {e}")
+        return []
+
+
+def fetch_act_structure_stats(act_id: int) -> dict:
+    """
+    Fetch precomputed structure statistics (counts by node type) for an act.
+    Returns the full stats dict from legal_admin, or {} on failure.
+    """
+    try:
+        resp = _session.get(
+            f"{API_BASE_URL}/api/v1/acts/{act_id}/structure-stats",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[warn] fetch_act_structure_stats act_id={act_id}: {e}")
+        return {}
+
+
+def fetch_act_nodes_by_type(act_id: int, node_type: str) -> dict:
+    """
+    Fetch an ordered list of nodes of the given type for an act.
+    Returns the full response dict with 'nodes' and 'count', or {} on failure.
+    """
+    try:
+        resp = _session.get(
+            f"{API_BASE_URL}/api/v1/acts/{act_id}/nodes-by-type",
+            params={"node_type": node_type},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[warn] fetch_act_nodes_by_type act_id={act_id} type={node_type}: {e}")
+        return {}
+
+
+def refresh_act_statistics(act_id: int) -> dict:
+    """Force-recompute and cache structure statistics for the act in legal_admin."""
+    try:
+        resp = _session.post(
+            f"{API_BASE_URL}/api/v1/acts/{act_id}/statistics/refresh",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[warn] refresh_act_statistics act_id={act_id}: {e}")
+        return {}
 
 
 def run_summarize_job(session_id: str) -> None:
