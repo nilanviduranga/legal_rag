@@ -35,6 +35,7 @@ from client import (
 )
 from llm import generate_answer, generate_discovery_answer
 from intent import classify_intent, is_discovery_intent, is_structural_intent
+from prompt_enhancer import is_harmful_query, needs_history, get_refusal_response
 from discovery import run_discovery
 from legal_structure import run_structural_query, format_structural_answer
 from ingest import build_index
@@ -163,6 +164,11 @@ def _post_answer(session_id: str, user_message: str, answer: str) -> None:
 def session_ask(session_id: str, question: Question, background_tasks: BackgroundTasks):
     require_store()
 
+    if is_harmful_query(question.question):
+        refusal = get_refusal_response()
+        background_tasks.add_task(_post_answer, session_id, question.question, refusal)
+        return {"answer": refusal, "intent": "harmful", "full_laws": []}
+
     intent = classify_intent(question.question)
 
     if is_structural_intent(intent):
@@ -217,11 +223,13 @@ def session_ask(session_id: str, question: Question, background_tasks: Backgroun
         }
 
     # ── Standard explanation pipeline ──────────────────────────────────────
-    f_summary = _io_executor.submit(fetch_session_summary, session_id)
-    f_chats   = _io_executor.submit(fetch_unsummarized_chats, session_id)
+    use_history = needs_history(question.question)
+
+    f_summary = _io_executor.submit(fetch_session_summary, session_id) if use_history else None
+    f_chats   = _io_executor.submit(fetch_unsummarized_chats, session_id) if use_history else None
     matched   = hybrid_search(question.question)
-    summary   = f_summary.result()
-    recent_chats = f_chats.result()
+    summary      = f_summary.result() if f_summary else None
+    recent_chats = f_chats.result()   if f_chats   else None
 
     full_laws = _resolve_laws(matched)
     try:
