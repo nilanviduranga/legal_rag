@@ -1,1399 +1,1132 @@
-# System Overview: Legal RAG — A Hybrid Retrieval-Augmented Generation System for Sri Lankan Legal Query Resolution
+# System Overview: Legal RAG — Hybrid Retrieval-Augmented Generation for Sri Lankan Legal Query Resolution
 
 ---
 
-> **Document Classification:** Academic Technical Report  
-> **System Version:** As of commit `285046f` (Case Law integration)  
-> **Source Repository:** `legal-rag` (branch: `main`)  
-> **Prepared for:** Bachelor's / Master's Thesis Documentation  
+> **Document Classification:** Academic Technical Report
+> **System Version:** Current `main` branch — reflects all merged PRs through the act-metadata and multi-pipeline work
+> **Prepared for:** Bachelor's / Master's Thesis Documentation
 
 ---
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [System Overview](#2-system-overview)
-3. [Software Architecture](#3-software-architecture)
-4. [System Components](#4-system-components)
-5. [Module Analysis](#5-module-analysis)
-6. [Database Design](#6-database-design)
-7. [API Design](#7-api-design)
-8. [Authentication and Authorization](#8-authentication-and-authorization)
-9. [Frontend Architecture](#9-frontend-architecture)
-10. [Backend Architecture](#10-backend-architecture)
-11. [External Integrations](#11-external-integrations)
-12. [Infrastructure and Deployment](#12-infrastructure-and-deployment)
-13. [Data Flow Analysis](#13-data-flow-analysis)
-14. [Design Patterns](#14-design-patterns)
-15. [Non-Functional Requirements](#15-non-functional-requirements)
-16. [Technology Stack](#16-technology-stack)
-17. [System Workflow](#17-system-workflow)
-18. [Thesis Documentation Section](#18-thesis-documentation-section)
-19. [Code Metrics](#19-code-metrics)
-20. [Conclusion](#20-conclusion)
+2. [System Architecture](#2-system-architecture)
+3. [Core Features](#3-core-features)
+4. [Safety & Compliance](#4-safety--compliance)
+5. [Query Routing & Intent Classification](#5-query-routing--intent-classification)
+6. [Knowledge Base & Ingestion Pipeline](#6-knowledge-base--ingestion-pipeline)
+7. [Retrieval Pipeline](#7-retrieval-pipeline)
+8. [Response Generation](#8-response-generation)
+9. [Session & Memory Management](#9-session--memory-management)
+10. [LLM Integration](#10-llm-integration)
+11. [Project Structure](#11-project-structure)
+12. [API Documentation](#12-api-documentation)
+13. [Configuration](#13-configuration)
+14. [Performance Optimizations](#14-performance-optimizations)
+15. [Security](#15-security)
+16. [Current Limitations](#16-current-limitations)
 
 ---
 
 ## 1. Executive Summary
 
-### 1.1 Purpose of the System
+### 1.1 Purpose
 
-The **Legal RAG** system is a Retrieval-Augmented Generation (RAG) service purpose-built to answer natural-language legal queries pertaining to Sri Lankan Consumer Protection and Labour laws. It serves as an intelligent legal assistant backend, bridging structured legal corpora with modern large language model (LLM) reasoning capabilities.
+The **Legal RAG** system is a Retrieval-Augmented Generation service purpose-built to answer natural-language legal queries about Sri Lankan law — primarily Consumer Protection and Labour statutes and their associated case law. It bridges structured legal corpora with modern LLM reasoning, producing grounded, citation-backed answers while actively refusing requests that seek to exploit or circumvent the law.
 
-### 1.2 Main Business Problem Solved
+### 1.2 What the System Solves
 
-Access to legal knowledge in Sri Lanka — as in many developing jurisdictions — is typically gated by high professional costs and complex legal language. Citizens and legal professionals alike often struggle to locate relevant statutory provisions or understand how courts have interpreted those provisions in case law. The system addresses this problem by:
+Access to legal knowledge is typically gated by high professional costs and complex legal language. Citizens and legal professionals struggle to find relevant statutory provisions or understand how courts have applied them. This system addresses that by:
 
-1. Ingesting and indexing the full text of Consumer Protection and Labour statute law from a structured legal knowledge API.
-2. Indexing decided court cases (case law) that interpret those statutes.
-3. Accepting user questions in plain English and retrieving the most relevant legal excerpts using hybrid semantic + lexical search.
-4. Passing those excerpts to an LLM that generates grounded, citation-backed answers — refusing to answer outside the provided context.
+1. Ingesting and indexing full statute text from a structured Legal Admin API.
+2. Indexing court decisions (case law) that interpret those statutes.
+3. Generating AI-produced metadata summaries for each Act to enable discovery queries.
+4. Accepting plain-English questions, routing them through the appropriate pipeline, and returning grounded answers with source citations.
+5. Refusing questions that seek to facilitate illegal, deceptive, or harmful activity.
 
-### 1.3 Key Features
+### 1.3 System Maturity
 
-| Feature | Description |
-|---|---|
-| Hybrid search | Combines FAISS dense vector search with BM25 sparse retrieval, unified by a cross-encoder reranker |
-| Dual corpus | Separate indexes for statutes (legislation) and case law (precedent) |
-| Session memory | Per-session conversation history with rolling summarisation to stay within LLM context limits |
-| Cross-reference resolution | Automatically fetches statutory cross-references at query time for richer context |
-| Parallel I/O | ThreadPoolExecutor pipelines overlap HTTP fetches with vector search |
-| Admin index rebuild | Live-safe endpoints to rebuild one or both FAISS indexes without downtime |
-| OpenAI-compatible LLM | Swappable LLM backend; currently Groq's `llama-3.1-8b-instant` via the OpenAI SDK |
-
-### 1.4 Intended Users
-
-- **End users (citizens):** Laypersons querying the chat frontend hosted at `ludexora.live` to understand their consumer or employment rights.
-- **Legal practitioners:** Lawyers and paralegals using the assistant as a first-pass research tool.
-- **System administrators:** Developers managing the `ludexora.live` platform who trigger index rebuilds or session management operations.
+The system has grown from a two-endpoint statute-only RAG to a multi-pipeline service with:
+- **4 distinct query pathways** (harmful refusal, structural lookup, act discovery, standard explanation)
+- **3 separate FAISS vector stores** (statutes, case law, act-level metadata)
+- **2 LLM providers** (Groq + Gemini, auto-detected from available API keys)
+- **15 REST endpoints**
+- **13 Python source modules**
 
 ---
 
-## 2. System Overview
+## 2. System Architecture
 
-### 2.1 High-Level Description
+### 2.1 Architectural Style
 
-Legal RAG is a **stateless Python microservice** that exposes a RESTful HTTP API via FastAPI. The service itself holds no persistent user data; all session and chat state is delegated to an external Chat API (`ludexora.live`). All legal source data — both statutes and case law — is consumed at index-build time from a Legal Admin API (`admin.ludexora.live`). The indexed data is persisted locally as FAISS binary index files and Python pickle files.
+The service is a **layered monolithic microservice**:
 
-At query time, the service executes a multi-stage retrieval pipeline, fetches enriched law text from the Legal Admin API, and streams a prompt to a remote LLM (Groq) to produce a grounded natural-language answer.
+- **Monolithic** in deployment — a single Python `uvicorn` process.
+- **Layered** internally — API → intent/safety → retrieval → generation → external I/O.
+- **Microservice** in disposition — stateless, externalising all persistent data to remote APIs.
+- **RAG pipeline** at its core — every explanation-type query follows a retrieve-then-read pattern.
 
-### 2.2 Core Functionalities
-
-1. **Index ingestion:** Pull law text and case law from the admin API, chunk it, embed it, and store it as FAISS + BM25 indexes.
-2. **Hybrid retrieval:** For any query, run FAISS (semantic) and BM25 (keyword) searches, union the candidates, and rerank with a cross-encoder.
-3. **Context enrichment:** For statute hits, call the admin API to fetch full law text and cross-referenced provisions.
-4. **LLM answer generation:** Construct a structured prompt from conversation memory, retrieved law, and the question; call Groq; return the answer.
-5. **Session lifecycle management:** Proxy session creation, chat storage, history retrieval, and rolling summarisation through the Chat API.
-6. **Administrative operations:** Rebuild one or both vector indexes on demand.
-
-### 2.3 System Boundaries
+### 2.2 High-Level System Boundaries
 
 ```
-┌───────────────────────────────────────────────────────┐
-│                 Legal RAG Service                     │
-│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────────────┐ │
-│  │ app.py │ │search.py│ │ llm.py │ │   client.py    │ │
-│  └────────┘ └────────┘ └────────┘ └────────────────┘ │
-│           (faiss_index/ — local disk)                 │
-└──────────────────────┬────────────────────────────────┘
-                       │
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
- ┌─────────────┐ ┌──────────┐ ┌────────────┐
- │ Legal Admin │ │ Chat API │ │  Groq LLM  │
- │  API        │ │ (ludex.) │ │  (cloud)   │
- │ (ludex.admin)│ └──────────┘ └────────────┘
- └─────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                        Legal RAG Service                           │
+│                                                                    │
+│  ┌──────────┐ ┌─────────────┐ ┌──────────┐ ┌──────────────────┐  │
+│  │  app.py  │ │  search.py  │ │  llm.py  │ │   client.py      │  │
+│  │(routing) │ │(FAISS+BM25) │ │(Groq/Gem)│ │(HTTP gateway)    │  │
+│  └──────────┘ └─────────────┘ └──────────┘ └──────────────────┘  │
+│                                                                    │
+│  ┌──────────────┐ ┌────────────┐ ┌──────────────┐ ┌───────────┐  │
+│  │ intent.py    │ │discovery.py│ │legal_struc.. │ │prompt_enh.│  │
+│  │(classify)    │ │(count/list)│ │(struct lookup)│ │(harm check)│ │
+│  └──────────────┘ └────────────┘ └──────────────┘ └───────────┘  │
+│                                                                    │
+│           faiss_index/  (3 sets of .index + .pkl files)           │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │
+             ┌─────────────────┼─────────────────┐
+             ▼                 ▼                 ▼
+   ┌──────────────────┐ ┌──────────────┐ ┌──────────────┐
+   │ Legal Admin API  │ │   Chat API   │ │  LLM (cloud) │
+   │ admin.ludexora.. │ │ ludexora.live│ │  Groq/Gemini │
+   └──────────────────┘ └──────────────┘ └──────────────┘
 ```
 
-**Within boundary:** FastAPI server, search engine, LLM client, ingestion scripts, vector indexes.  
-**Outside boundary:** Legal Admin API (law data), Chat API (session/chat persistence), Groq (LLM inference), any frontend UI.
+**Inside boundary:** FastAPI server, all search and generation logic, ingestion scripts, local vector indexes.
+**Outside boundary:** Legal Admin API (law source data), Chat API (session/chat persistence), LLM provider (inference).
 
-### 2.4 Major Subsystems
+### 2.3 Major Subsystems
 
-| Subsystem | Modules |
-|---|---|
-| Ingestion | `ingest.py`, `ingest_caselaw.py`, `ingest_api.py` |
-| Search Engine | `search.py` |
-| LLM Integration | `llm.py` |
-| External API Gateway | `client.py` |
-| API Layer | `app.py` |
-| Configuration | `config.py` |
+| Subsystem | Modules | Role |
+|---|---|---|
+| API / Orchestration | `app.py` | Request routing, pipeline coordination, background tasks |
+| Safety Layer | `prompt_enhancer.py` | Harmful query detection and refusal |
+| Intent Classification | `intent.py` | Route each query to the correct pipeline |
+| Hybrid Search | `search.py` | Three FAISS stores + BM25 + CrossEncoder reranker |
+| Act Discovery | `discovery.py` | Count/list queries across the act corpus |
+| Structural Lookup | `legal_structure.py` | Deterministic DB-backed structural queries |
+| LLM Integration | `llm.py` | Answer generation, discovery narration, summarisation |
+| External I/O | `client.py` | HTTP client to Admin API and Chat API |
+| Ingestion — Statutes | `ingest.py` | Fetch, chunk, embed, index statutory law |
+| Ingestion — Case Law | `ingest_caselaw.py` | Fetch, chunk, embed, index court decisions |
+| Act Metadata | `metadata_gen.py` | Generate AI metadata per Act for discovery FAISS |
+| Configuration | `config.py` | All constants and environment bindings |
 
----
-
-## 3. Software Architecture
-
-### 3.1 Architectural Style
-
-The system employs a **layered monolithic microservice** architecture. It is:
-
-- **Monolithic** in deployment — a single Python process (`uvicorn` serving `app.py`).
-- **Layered** internally — API layer → orchestration layer → search/LLM layers → HTTP gateway layer.
-- **Microservice** in disposition — stateless, externally delegating all persistence, and designed to be called over HTTP from a separate frontend and other backend services.
-
-This can also be classified as a **RAG pipeline architecture**, a specialised variant of the pipeline architectural pattern where a retrieve-then-read flow is central to the system's value.
-
-### 3.2 Architecture Rationale
-
-The architectural choices are driven by three constraints evident from the codebase:
-
-1. **Research context** (`/Documents/Reserch/`): The system prioritises correctness of retrieval over production-grade scale. Simple flat FAISS indexes (no approximate search) and a single-process server reflect a research-first design.
-2. **Thin wrapper philosophy**: As documented in project memory, the team explicitly chose to avoid LangChain agent abstractions. The pipeline is hand-coded for full transparency and control.
-3. **Externalised state**: No database is owned by this service. Session and chat data lives in the Chat API, law data in the Legal Admin API. This keeps the RAG service itself simple and replaceable.
-
-### 3.3 Component Interactions
+### 2.4 Request Flow Overview
 
 ```
-Client Request
-     │
-     ▼
-┌──────────────────────────────────────────────────────┐
-│  app.py  (FastAPI — request routing, orchestration)  │
-│  ┌─────────────────────────────────────────────────┐ │
-│  │ POST /sessions/{id}/ask                         │ │
-│  │  1. Parallel: fetch summary + unsummarised chats│ │
-│  │  2. hybrid_search(question)                     │ │
-│  │  3. _resolve_laws(matched)                      │ │
-│  │  4. generate_answer(question, laws, memory)     │ │
-│  │  5. store_chat(session_id, q, answer)           │ │
-│  │  6. if count >= 5: background summarise         │ │
-│  └─────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
-         │           │              │
-         ▼           ▼              ▼
-   search.py      client.py      llm.py
- (FAISS+BM25+   (HTTP→Chat    (Groq API →
-  CrossEncoder)   API & Admin   Llama 3.1)
-                   API)
+Incoming question
+       │
+       ▼
+┌─────────────────────────────────────────────────────────┐
+│  prompt_enhancer.is_harmful_query()                     │
+│  → YES: return refusal immediately                      │
+│  → NO: continue                                         │
+└───────────────────────────┬─────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│  intent.classify_intent()  ── LLM call at temp=0.0     │
+│  Labels: structural | count | list |                    │
+│          explain | definition | compare | procedure | penalty │
+└─────────────────────────────────────────────────────────┘
+          │                   │                   │
+          ▼ structural        ▼ count/list        ▼ everything else
+   ┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
+   │legal_struct.│     │  discovery  │     │   hybrid search  │
+   │DB lookup    │     │ act FAISS   │     │statute+caselaw   │
+   │no LLM/FAISS │     │+ per-act ev.│     │FAISS+BM25+rerank │
+   └──────┬──────┘     └──────┬──────┘     └────────┬─────────┘
+          │                   │                      │
+          ▼                   ▼                      ▼
+   format_structural_   generate_discovery_     generate_answer()
+   answer() — pure text  answer() — LLM         — LLM
 ```
 
-### 3.4 Data Flow Explanation
+---
 
-A user question enters `app.py`, which immediately fans out to two concurrent I/O tasks (session summary + recent chats from the Chat API) while synchronously running the hybrid vector search. Once the top-ranked document chunks are identified, `_resolve_laws()` fetches the enriched statutory text — including cross-references — from the Legal Admin API in parallel using a thread pool. The assembled legal context, conversation memory, and the question are then passed to the Groq LLM. The answer is stored in the Chat API, and if the conversation has accumulated enough turns, a rolling summarisation job is queued as a FastAPI `BackgroundTask`.
+## 3. Core Features
+
+| Feature | Implementation |
+|---|---|
+| **Legal question answering** | Standard explanation pipeline: hybrid retrieval → context enrichment → LLM answer |
+| **Semantic search** | FAISS `IndexFlatIP` with BAAI/bge-base-en-v1.5 embeddings (768-dim, cosine similarity) |
+| **Hybrid retrieval** | FAISS semantic ∪ BM25 keyword candidates, then CrossEncoder reranking |
+| **Dual corpus** | Separate indexes for statutes (legislation) and case law (judicial decisions) |
+| **Citation generation** | LLM system prompt mandates Act name + section for statutes; case name + citation for case law |
+| **Cross-reference resolution** | Statute chunks trigger Admin API call for law text plus all cross-referenced nodes |
+| **Act discovery** | Semantic search over per-act AI metadata FAISS index; answers "how many acts cover X?" |
+| **Structural queries** | Deterministic DB lookup for "how many sections in Act Y?" — no LLM or FAISS involved |
+| **Conversation history** | Rolling LLM-generated summary + recent unsummarised chats sent as context |
+| **History reference detection** | Regex patterns detect when a question references prior context; history fetch is skipped otherwise |
+| **Multi-document context** | Up to 3 statute + 3 case law chunks passed to the LLM per query |
+| **Evidence-based answers** | LLM system prompt enforces context-only answering; explicit refusal when context is insufficient |
+| **Swappable LLM provider** | Auto-detects Groq or Gemini from available API keys; LLM_PROVIDER env var for explicit choice |
+| **Background summarisation** | After every 5th chat exchange, rolling summary is updated in a non-blocking background task |
+| **Selective history fetching** | `needs_history()` regex gates the I/O cost of fetching session context |
 
 ---
 
-## 4. System Components
+## 4. Safety & Compliance
 
-### 4.1 Component: FastAPI Application (`app.py`)
+### 4.1 Harmful Query Detection
 
-| Attribute | Detail |
+Before any retrieval or LLM call, every incoming question is evaluated by `prompt_enhancer.is_harmful_query()`. This function applies 28 compiled regex patterns against the lowercased question text:
+
+**Pattern categories:**
+
+| Category | Example triggers |
 |---|---|
-| **Purpose** | HTTP API layer and request orchestration hub |
-| **Responsibilities** | Route HTTP requests, orchestrate the retrieve→enrich→generate→store pipeline, manage session lifecycle, trigger admin operations |
-| **Inputs** | HTTP POST/GET/PATCH/DELETE requests from clients |
-| **Outputs** | JSON responses: answers with cited law, session metadata, chat records |
-| **Dependencies** | `search.py`, `llm.py`, `client.py`, `ingest.py`, `ingest_caselaw.py`, `config.py` |
-| **Technologies** | Python 3.x, FastAPI, Pydantic v2, `concurrent.futures.ThreadPoolExecutor` |
+| Tax fraud and evasion | `hide.*tax`, `tax.*fraud`, `evade.*tax`, `tax.*evasion` |
+| Evidence tampering | `destroy.*evidence`, `tamper.*evidence`, `conceal.*evidence`, `hide.*evidence` |
+| Avoiding law enforcement | `avoid.*getting caught`, `not.*get caught`, `get away with` |
+| Money laundering | `launder`, `money laundering` |
+| Fraud schemes | `fraud.*scheme`, `scheme.*fraud` |
+| Bribery and corruption | `bribery`, `pay.*bribe`, `corrupt.*officer` |
+| Embezzlement | `embezzl` |
+| Concealment of crime | `cover.*illegal`, `cover.*crime`, `hide.*crime`, `hide.*activities` |
+| Direct crime facilitation | `commit.*crime`, `commit.*fraud`, `commit.*offence` |
 
-### 4.2 Component: Search Engine (`search.py`)
+### 4.2 Refusal Workflow
 
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Unified hybrid retrieval over two FAISS + BM25 index stores |
-| **Responsibilities** | Load indexes, encode queries, run FAISS ANN search, run BM25 keyword search, union candidates, rerank with CrossEncoder, return top-K results per corpus |
-| **Inputs** | Natural-language query string |
-| **Outputs** | Ranked list of chunk dicts (statute or caselaw) |
-| **Dependencies** | `config.py`, FAISS index files, BAAI/bge-base-en-v1.5, BAAI/bge-reranker-base |
-| **Technologies** | `faiss-cpu`, `sentence-transformers`, `rank-bm25`, `numpy` |
+```
+User question
+      │
+      ▼
+is_harmful_query(question)  ←── 28 regex patterns against lowercased text
+      │
+  YES │                         NO ──► normal pipeline
+      ▼
+get_refusal_response()  ←── static response string (no LLM call)
+      │
+      ▼
+Return immediately: {"answer": refusal, "intent": "harmful", "full_laws": []}
+      │
+      ▼
+_post_answer() as BackgroundTask
+(stores the refusal in Chat API so conversation history is coherent)
+```
 
-### 4.3 Component: LLM Integration (`llm.py`)
+The refusal response directs the user to consult a qualified attorney, contact the relevant regulatory authority, or review applicable laws for compliance guidance. No retrieval is performed. No LLM is called. The response is deterministic and immediate.
 
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Answer generation and conversation summarisation via a remote LLM |
-| **Responsibilities** | Build structured prompts, call Groq API, parse responses, enforce grounding (no hallucination outside context) |
-| **Inputs** | Question string, list of law context blocks (statute strings + caselaw dicts), summary, recent chat list |
-| **Outputs** | Natural-language answer string or summary string |
-| **Dependencies** | Groq API (`GROQ_API_KEY`), OpenAI Python SDK |
-| **Technologies** | `openai` Python SDK, Groq API, `llama-3.1-8b-instant` model |
+### 4.3 Differences from Normal Queries
 
-### 4.4 Component: External API Gateway (`client.py`)
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Centralised HTTP client for all outbound API calls |
-| **Responsibilities** | Authenticate, retry, and call Legal Admin API and Chat API; run summarisation background jobs |
-| **Inputs** | Function-level parameters (node_id, session_id, user_id, payloads) |
-| **Outputs** | Parsed Python dicts / lists from JSON responses |
-| **Dependencies** | `config.py`, `llm.py` (for `generate_summary`), `requests`, `API_TOKEN` |
-| **Technologies** | `requests`, `urllib3.util.retry.Retry`, connection pooling (10 connections, 20 max) |
-
-### 4.5 Component: Statute Index Builder (`ingest.py`)
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Build the FAISS + BM25 index for statutory law |
-| **Responsibilities** | Fetch all leaf law nodes, retrieve full law text per node, chunk text, embed chunks, build and persist FAISS index and BM25 corpus |
-| **Inputs** | `API_BASE_URL`, a loaded `SentenceTransformer` embedder, auth headers |
-| **Outputs** | `faiss_index/legal.index`, `faiss_index/chunks.pkl`, `faiss_index/bm25_corpus.pkl` |
-| **Dependencies** | Legal Admin API, `sentence-transformers`, `faiss-cpu`, `langchain-text-splitters` |
-| **Technologies** | Python, FAISS `IndexFlatIP`, `RecursiveCharacterTextSplitter` (800 tokens, 100 overlap) |
-
-### 4.6 Component: Case Law Index Builder (`ingest_caselaw.py`)
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Build the FAISS + BM25 index for case law precedents |
-| **Responsibilities** | Fetch all active case laws, chunk content, embed, build and persist separate FAISS + BM25 files |
-| **Inputs** | `API_BASE_URL`, a loaded `SentenceTransformer` embedder, auth headers |
-| **Outputs** | `faiss_index/caselaw.index`, `faiss_index/caselaw_chunks.pkl`, `faiss_index/caselaw_bm25.pkl` |
-| **Dependencies** | Legal Admin API (`/api/v1/case-laws`), same embedding model as statute ingestion |
-| **Technologies** | Python, FAISS `IndexFlatIP`, `RecursiveCharacterTextSplitter` |
-
-### 4.7 Component: Configuration (`config.py`)
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Centralised environment configuration |
-| **Responsibilities** | Load `.env` file, export all runtime constants and path strings |
-| **Inputs** | Environment variables |
-| **Outputs** | Module-level constants consumed by all other modules |
-| **Technologies** | `python-dotenv` |
-
----
-
-## 5. Module Analysis
-
-### 5.1 `app.py` — API Layer and Orchestration
-
-**Functionality:** Defines all 13 FastAPI route handlers and two internal orchestration helpers (`_resolve_laws`, `_io_executor`). It is the only module that knows the full request lifecycle end-to-end.
-
-**Key Functions:**
-
-| Function | Lines | Responsibility |
+| Aspect | Normal Query | Harmful Query |
 |---|---|---|
-| `_resolve_laws(matched)` | 80–127 | Separates statute vs caselaw chunks; fetches statute law text in parallel; assembles enriched context list |
-| `session_ask(session_id, question, background_tasks)` | 152–184 | Main RAG pipeline: parallel I/O → search → resolve → generate → store → summarise |
-| `rebuild_vectordb()` | 247–267 | Admin: delete all index files, rebuild both indexes, reload into memory |
-| `rebuild_caselaw_vectordb()` | 270–281 | Admin: rebuild only case law index |
+| FAISS search | Performed | Skipped |
+| Admin API calls | Performed | Skipped |
+| LLM call | Performed | Skipped |
+| Response latency | ~1–5 seconds | ~1ms (regex only) |
+| `full_laws` field | Populated | Empty array |
+| `intent` field | Classified label | `"harmful"` |
+| Chat persistence | Background | Background |
 
-**Pydantic Models:** `Question`, `SessionCreate`, `TitleUpdate`, `ChatCreate`, `SummaryUpdate`, `MarkSummarized`
+### 4.4 Other Safety Guardrails
 
-**Concurrency:** Two `ThreadPoolExecutor` pools: `_law_executor` (6 workers for parallel law fetches) and `_io_executor` (4 workers for parallel summary + chat fetches at ask time).
+**Prompt-level grounding enforcement:**
+The main LLM system prompt explicitly instructs the model to refuse answering when the retrieved context is insufficient: *"If the answer cannot be determined from the provided context, say so explicitly — do not guess or fabricate."*
 
-**Relationships:** Imports from every other module; acts as the composition root.
+**Temperature control:**
+- Explanation answers: temperature 0.2 (low randomness, close to retrieved text)
+- Discovery narration: temperature 0.1 (even lower — just enumerate the found Acts)
+- Summaries: temperature 0.1 (faithful compression, not creative)
+- Intent classification: temperature 0.0 (fully deterministic)
+
+**Input validation:**
+All request bodies are typed Pydantic models. FastAPI enforces types and rejects malformed payloads before any application logic runs.
+
+**Startup token validation:**
+`client.check_api_token()` probes the Admin API at startup. A 401 response raises a `RuntimeError` and kills the process, preventing the service from silently serving results against an invalid backend.
 
 ---
 
-### 5.2 `search.py` — Hybrid Search Engine
+## 5. Query Routing & Intent Classification
 
-**Functionality:** Maintains two in-memory stores (`store` for statutes, `caselaw_store` for case law) and implements the two-stage hybrid retrieval + reranking pipeline.
+### 5.1 Intent Labels
 
-**Key Functions:**
+After the harm check, every question is classified by a single LLM call at temperature 0.0:
 
-| Function | Lines | Responsibility |
+| Label | Meaning | Pipeline |
 |---|---|---|
-| `load_store()` | 25–31 | Deserialise statute FAISS index, chunks, and BM25 model from disk |
-| `load_caselaw_store()` | 33–44 | Deserialise case law stores; no-op if files absent |
-| `_candidates(query, s, k)` | 63–71 | FAISS top-K (inner product) ∪ BM25 top-K → combined candidate set |
-| `hybrid_search(query)` | 74–89 | Run `_candidates` on both stores; cross-encoder rerank; return statute top-3 + caselaw top-3 |
-| `chunk_node_id(c)` | 55–56 | Extract `node_id` from a chunk dict |
+| `structural` | Questions about the internal structure of a **named Act** (sections/clauses count or list) | `legal_structure.run_structural_query()` |
+| `count` | "How many laws/acts exist on topic X?" | `discovery.run_discovery()` |
+| `list` | "Name all acts related to topic Y?" | `discovery.run_discovery()` |
+| `explain` | What does a provision or law mean? | `hybrid_search()` → `generate_answer()` |
+| `definition` | What does a legal term mean? | `hybrid_search()` → `generate_answer()` |
+| `compare` | Compare two provisions or acts | `hybrid_search()` → `generate_answer()` |
+| `procedure` | Steps to do something legally | `hybrid_search()` → `generate_answer()` |
+| `penalty` | Punishments, fines, sentences | `hybrid_search()` → `generate_answer()` |
 
-**BGE Query Prefix:** The constant `_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "` is prepended to all queries at embed time, which is the documented best practice for the BAAI/bge-base-en-v1.5 asymmetric retrieval model.
+If the LLM returns an unexpected label, or if classification fails, the system defaults to `"explain"` (the standard pipeline).
 
-**Relationships:** Loaded at app startup by `app.py`; stores are module-level globals shared by reference.
+### 5.2 Routing Logic
 
----
-
-### 5.3 `llm.py` — LLM Integration
-
-**Functionality:** Wraps the Groq LLM (via OpenAI SDK) with two specialised functions and enforces grounded, citation-first answering through a carefully constructed system prompt.
-
-**Key Functions:**
-
-| Function | Lines | Responsibility |
-|---|---|---|
-| `generate_answer(question, full_laws, summary, recent_chats)` | 30–63 | Assemble context blocks (summary → recent chats → laws → question); call LLM at temperature 0.2; max 1024 tokens |
-| `generate_summary(old_summary, chats)` | 66–89 | Produce a ≤250-word rolling summary incorporating prior summary and new exchanges; temperature 0.1 |
-| `_format_block(chunk)` | 23–27 | Tag statute chunks with `[STATUTE]` label; pass caselaw chunk text as-is |
-
-**System Prompt Behaviour:** The system prompt mandates: lead with statute provisions, use case law to illustrate judicial interpretation, cite Act name/section for statutes and case name/citation for case law, and explicitly refuse to answer if the context is insufficient.
-
-**Relationships:** Called by `app.py` (for `generate_answer`) and `client.py` (for `generate_summary` within the background summarisation job).
-
----
-
-### 5.4 `client.py` — External API Gateway
-
-**Functionality:** Provides a unified, retry-capable HTTP interface to both external APIs. Owns the `run_summarize_job` workflow — the only multi-step logic outside of `app.py`.
-
-**Key Functions:**
-
-| Function | External API | Purpose |
-|---|---|---|
-| `check_api_token()` | Admin API | Startup validation — fails fast on bad token |
-| `fetch_full_law(node_id)` | Admin API | GET law text for a single node |
-| `fetch_law_with_context(node_id)` | Admin API | GET law text + cross-references |
-| `create_session(payload)` | Chat API | Create a new chat session |
-| `update_session_title(session_id, title)` | Chat API | PATCH session title |
-| `store_chat(session_id, q, answer)` | Chat API | Persist a Q&A exchange |
-| `get_chats(session_id)` | Chat API | Retrieve all chats for a session |
-| `clear_chats(session_id)` | Chat API | Delete all chats in a session |
-| `fetch_chat_count(session_id)` | Chat API | Count chats (triggers summarisation threshold) |
-| `get_history(user_id)` | Chat API | Retrieve all sessions for a user |
-| `fetch_session_summary(session_id)` | Chat API | Get current rolling summary |
-| `fetch_unsummarized_chats(session_id)` | Chat API | Get chats not yet rolled into summary |
-| `update_session_summary(session_id, summary)` | Chat API | PATCH summary text |
-| `mark_chats_summarized(chat_ids)` | Chat API | Flag specific chat records as summarised |
-| `run_summarize_job(session_id)` | Chat API + LLM | Full summarisation pipeline: fetch → generate → patch → mark |
-
-**Retry Policy:** `Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504])` — retries twice on gateway errors with exponential back-off.
-
----
-
-### 5.5 `ingest.py` — Statute Index Builder (Production)
-
-**Functionality:** Fetches all leaf nodes from the Legal Admin API, retrieves each node's full law text, chunks it with a sliding window, generates embeddings, and builds a FAISS `IndexFlatIP` index.
-
-**Key Design Decision:** Uses `IndexFlatIP` (inner product / cosine similarity with normalised embeddings) rather than `IndexFlatL2` as in the earlier `ingest_api.py`. This aligns with the `normalize_embeddings=True` call in the embedder, ensuring cosine similarity is correctly computed.
-
----
-
-### 5.6 `ingest_caselaw.py` — Case Law Index Builder
-
-**Functionality:** Parallel to `ingest.py` but targets the `/api/v1/case-laws` endpoint. Each chunk is tagged with `case_law_id`, `case_name`, and `source="caselaw"` — a discriminator used throughout the pipeline to handle case law differently from statutes.
-
-**Chunk Schema:**
 ```python
+# Structural check first — most specific, no fallback needed
+if is_structural_intent(intent):
+    return structural_pipeline(question)
+
+# Discovery check — requires act_store to be loaded
+if is_discovery_intent(intent) and act_store:
+    return discovery_pipeline(question)
+
+# All other intents → standard explanation pipeline
+return standard_pipeline(question)
+```
+
+### 5.3 History-Relevance Detection
+
+Inside the standard pipeline, a second regex check (`prompt_enhancer.needs_history()`) determines whether to fetch conversation context. This avoids unnecessary Chat API calls for self-contained questions.
+
+Patterns that trigger history fetch include references like "that act", "as you mentioned", "elaborate", "tell me more", "from the previous message", "continue", etc. (18 patterns total). If none match, `summary` and `recent_chats` are both `None`, and the prompt is built without conversation context.
+
+---
+
+## 6. Knowledge Base & Ingestion Pipeline
+
+### 6.1 Document Types
+
+| Corpus | Source | API Endpoint | Content |
+|---|---|---|---|
+| **Statutes** | Legal Admin API | `GET /api/v1/nodes/leaf` + `/nodes/{id}/law-path` | Full text of leaf-level law nodes (sections, subsections, etc.) |
+| **Case Law** | Legal Admin API | `GET /api/v1/case-laws` | Full text of decided court cases |
+| **Act Metadata** | Legal Admin API + LLM | `GET /api/v1/acts` + LLM extraction | AI-generated summaries, keywords, domains, subjects per Act |
+
+### 6.2 Chunking Strategy
+
+Both statutes and case law use `RecursiveCharacterTextSplitter` from `langchain-text-splitters`:
+
+- **Chunk size:** 800 characters
+- **Overlap:** 100 characters
+- **Splitter behaviour:** Tries to split on double newlines, then single newlines, then spaces, then characters — preserving sentence boundaries where possible.
+
+Each statute chunk stores: `{"text": "[Node ID: {node_id}]\n\n{chunk}", "node_id": str, "act_id": int}`.
+
+Each case law chunk stores: `{"text": "[CASE LAW] {case_name}\n\n{chunk}", "case_law_id": int, "case_name": str, "source": "caselaw"}`.
+
+### 6.3 Embedding
+
+All embeddings are produced by `BAAI/bge-base-en-v1.5` (768-dimensional, CPU inference):
+
+- `normalize_embeddings=True` is passed at encode time, producing unit vectors.
+- FAISS `IndexFlatIP` (inner product) on unit vectors is mathematically equivalent to cosine similarity.
+- At query time, the BGE asymmetric query prefix is prepended: `"Represent this sentence for searching relevant passages: "` — following the model's intended usage for asymmetric retrieval (query instruction vs. passage embedding).
+
+### 6.4 Act Metadata Index
+
+For act discovery queries, a separate FAISS index stores one vector per Act. Each vector is the embedding of a concatenated string:
+
+```
+{title}  {summary}  {keyword1 keyword2 ...}  {regulated_activity1 ...}  {legal_domain1 ...}  {subject1 ...}
+```
+
+This metadata is produced by `metadata_gen.generate_act_metadata()`, which calls the LLM with a ~3000-character text sample from the Act and extracts a structured JSON object:
+
+```json
 {
-    "text":        "[CASE LAW] <case_name>\n\n<chunk_text>",
-    "case_law_id": int,
-    "case_name":   str,
-    "source":      "caselaw"
+  "summary": "One sentence describing what this Act regulates.",
+  "keywords": ["word1", "word2"],
+  "legal_domains": ["Commercial Law"],
+  "regulated_activities": ["selling", "buying"],
+  "subjects": ["consumers", "employers"]
 }
 ```
 
----
+Metadata is stored back in the Legal Admin API (`POST /api/v1/acts/{id}/metadata`) so it persists across index rebuilds and can be fetched with `GET /api/v1/acts/all-metadata`.
 
-### 5.7 `ingest_api.py` — Legacy/Alternative Statute Builder
+### 6.5 Local Index Files
 
-**Functionality:** An earlier, standalone version of `ingest.py`. Uses `IndexFlatL2` instead of `IndexFlatIP` and does not call `normalize_embeddings=True`. This is the historical first iteration (commit `2eb78ea` "hybread rag") and has been superseded by `ingest.py`. It is retained as a runnable script.
-
----
-
-### 5.8 `config.py` — Configuration
-
-**Constants:**
-
-| Constant | Value | Purpose |
-|---|---|---|
-| `API_BASE_URL` | `https://admin.ludexora.live` | Legal Admin API base |
-| `CLIENT_BASE_URL` | `https://ludexora.live` | Chat API base |
-| `CANDIDATE_K` | 20 | Statute candidates from FAISS + BM25 before reranking |
-| `TOP_K` | 3 | Final statute results returned after reranking |
-| `CASELAW_CANDIDATE_K` | 15 | Case law candidates before reranking |
-| `CASELAW_TOP_K` | 3 | Final case law results after reranking |
-| `SUMMARIZE_THRESHOLD` | 5 | Chat count that triggers background summarisation |
-
----
-
-## 6. Database Design
-
-### 6.1 Database Type
-
-The Legal RAG service does **not own a relational database**. Its persistence layer consists of:
-
-1. **File-based vector stores** (local disk): FAISS binary indexes and Python pickle files under `faiss_index/`.
-2. **External relational database** (via Chat API at `ludexora.live`): Stores sessions, chats, and summaries. The schema is not directly accessible from this codebase but is inferred from API contracts.
-
-### 6.2 Local File-Based Storage
-
-**Directory: `faiss_index/`**
+All indexes are stored under `faiss_index/`:
 
 | File | Format | Contents |
 |---|---|---|
-| `legal.index` | FAISS binary | IndexFlatIP over statute chunk embeddings (768-dim float32 vectors) |
-| `chunks.pkl` | Python pickle | `list[dict]` — each dict: `{"text": str, "node_id": str}` |
-| `bm25_corpus.pkl` | Python pickle | `list[list[str]]` — tokenised (lowercased, split) text per statute chunk |
-| `caselaw.index` | FAISS binary | IndexFlatIP over case law chunk embeddings (768-dim float32 vectors) |
-| `caselaw_chunks.pkl` | Python pickle | `list[dict]` — each dict: `{"text": str, "case_law_id": int, "case_name": str, "source": "caselaw"}` |
-| `caselaw_bm25.pkl` | Python pickle | `list[list[str]]` — tokenised text per case law chunk |
+| `legal.index` | FAISS binary | `IndexFlatIP` over statute chunk embeddings (768-dim float32) |
+| `chunks.pkl` | Pickle | `list[dict]` — statute chunk dicts with `text`, `node_id`, `act_id` |
+| `bm25_corpus.pkl` | Pickle | `list[list[str]]` — tokenised statute chunks for BM25 |
+| `caselaw.index` | FAISS binary | `IndexFlatIP` over case law chunk embeddings (768-dim float32) |
+| `caselaw_chunks.pkl` | Pickle | `list[dict]` — caselaw chunk dicts with `text`, `case_law_id`, `case_name`, `source` |
+| `caselaw_bm25.pkl` | Pickle | `list[list[str]]` — tokenised caselaw chunks for BM25 |
+| `act_meta.index` | FAISS binary | `IndexFlatIP` over per-Act metadata embeddings (768-dim float32) |
+| `act_meta_records.pkl` | Pickle | `list[dict]` — full metadata record per Act |
 
-### 6.3 Inferred External Database Schema
+### 6.6 Ingestion Workflow (Statutes)
 
-From API contracts in `client.py`, the Chat API manages at minimum the following entities:
-
-**Entity: ChatSession**
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | string/uuid | Primary key; used as `session_id` in all routes |
-| `user_id` | string | Foreign key to user; used in history queries |
-| `title` | string | Session display name; updatable via PATCH |
-| `summary` | text | Rolling LLM-generated summary of the conversation |
-
-**Entity: ChatMessage**
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | integer | Primary key; used in `mark_chats_summarized` |
-| `chat_session_id` | string | Foreign key to `ChatSession.id` |
-| `user_message` | text | The user's question |
-| `ai_response` | text | The LLM-generated answer |
-| `is_summarized` | boolean | Flag set by `mark-summarized` endpoint |
-
-### 6.4 ER Diagram (Inferred External Schema)
-
-```mermaid
-erDiagram
-    USER {
-        string id PK
-    }
-    CHAT_SESSION {
-        string id PK
-        string user_id FK
-        string title
-        text summary
-    }
-    CHAT_MESSAGE {
-        int id PK
-        string chat_session_id FK
-        text user_message
-        text ai_response
-        boolean is_summarized
-    }
-
-    USER ||--o{ CHAT_SESSION : "has"
-    CHAT_SESSION ||--o{ CHAT_MESSAGE : "contains"
+```
+POST /vectordb/rebuild-statutes
+        │
+        ▼
+Delete: legal.index, chunks.pkl, bm25_corpus.pkl
+Clear: store dict in search.py
+        │
+        ▼
+GET /api/v1/nodes/leaf  ←── all leaf law nodes
+        │
+        ▼
+For each node: GET /api/v1/nodes/{id}/law-path  ←── full law text
+        │
+        ▼
+RecursiveCharacterTextSplitter (800 chars, 100 overlap)
+        │
+        ▼
+SentenceTransformer encode (normalize_embeddings=True)
+        │
+        ▼
+FAISS IndexFlatIP.add(embeddings)
+BM25 corpus = tokenised chunk texts
+        │
+        ▼
+Write: legal.index, chunks.pkl, bm25_corpus.pkl
+        │
+        ▼
+load_store() → store dict populated in memory
 ```
 
-### 6.5 Vector Index Logical Schema
+Case law ingestion follows the same steps using `GET /api/v1/case-laws` and writing to the caselaw files.
 
-```mermaid
-erDiagram
-    STATUTE_CHUNK {
-        int faiss_index PK
-        string node_id
-        string text
-        float32_array embedding
-    }
-    STATUTE_BM25_TOKEN {
-        int chunk_index FK
-        string token
-    }
-    CASELAW_CHUNK {
-        int faiss_index PK
-        int case_law_id
-        string case_name
-        string source
-        string text
-        float32_array embedding
-    }
-    CASELAW_BM25_TOKEN {
-        int chunk_index FK
-        string token
-    }
+Act metadata rebuild (`POST /vectordb/rebuild-act-metadata`) calls `metadata_gen.generate_and_store_all(skip_existing=False)` to regenerate all Act metadata via LLM, then calls `build_act_store()` to build and persist the act-level FAISS index.
 
-    STATUTE_CHUNK ||--o{ STATUTE_BM25_TOKEN : "tokenized as"
-    CASELAW_CHUNK ||--o{ CASELAW_BM25_TOKEN : "tokenized as"
-```
-
----
-
-## 7. API Design
-
-### 7.1 API Architecture Overview
-
-The Legal RAG service exposes a **REST API** with 13 endpoints grouped into five functional areas:
-
-- **AI Q&A:** The core RAG pipeline endpoint.
-- **Session Management:** Create, title, and list sessions.
-- **Chat CRUD:** Persist and retrieve individual Q&A exchanges.
-- **Summary Management:** Read and write rolling session summaries.
-- **Administration:** Rebuild vector indexes.
-
-All request and response bodies are JSON. Authentication is via Bearer token in the `Authorization` header (see Section 8).
-
-### 7.2 Endpoint Reference
-
-#### 7.2.1 AI Q&A
-
----
-
-**`POST /sessions/{session_id}/ask`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Execute the full RAG pipeline: retrieve relevant laws, generate an LLM answer, persist the exchange |
-| **Path params** | `session_id` (string) — identifies the conversation session |
-| **Request body** | `{"question": "string"}` |
-| **Response** | `{"answer": "string", "full_laws": [ {"source": "statute"\|"caselaw", "text": "string", ...} ]}` |
-| **Auth required** | Yes (Bearer token validated on startup; service-wide) |
-| **Side effects** | Stores Q&A in Chat API; triggers background summarisation if count ≥ 5 |
-| **Business purpose** | Core product feature: answer a legal query with grounded citations |
-
----
-
-#### 7.2.2 Session Management
-
-**`POST /sessions`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Create a new chat session |
-| **Request body** | `{"user_id": "string", "title": "string (optional)"}` |
-| **Response** | Session object from Chat API |
-| **Auth required** | Yes |
-
-**`PATCH /sessions/{session_id}/title`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Update the display title of a session |
-| **Request body** | `{"title": "string"}` |
-| **Response** | Updated session object |
-| **Auth required** | Yes |
-
-**`GET /history/{user_id}`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Retrieve all chat sessions for a given user |
-| **Path params** | `user_id` (string) |
-| **Response** | `{"user_id": "string", "sessions": [...]}` |
-| **Auth required** | Yes |
-
----
-
-#### 7.2.3 Chat CRUD
-
-**`POST /sessions/{session_id}/chats`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Manually persist a Q&A pair (used for direct integration) |
-| **Request body** | `{"user_message": "string", "ai_response": "string"}` |
-| **Response** | `{"status": "created"}` |
-
-**`GET /sessions/{session_id}/chats`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Retrieve all chat messages in a session |
-| **Response** | `{"session_id": "string", "chats": [...]}` |
-
-**`DELETE /sessions/{session_id}/chats`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Delete all chats in a session |
-| **Response** | `{"status": "cleared"}` |
-
-**`GET /sessions/{session_id}/count`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Get the count of chat messages (used to decide whether to summarise) |
-| **Response** | `{"session_id": "string", "count": int}` |
-
----
-
-#### 7.2.4 Summary Management
-
-**`GET /sessions/{session_id}/summary`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Retrieve the current rolling summary for a session |
-| **Response** | `{"session_id": "string", "summary": "string\|null"}` |
-
-**`PATCH /sessions/{session_id}/summary`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Manually update a session summary |
-| **Request body** | `{"summary": "string"}` |
-| **Response** | `{"status": "updated"}` |
-
-**`PATCH /mark-summarized`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Mark specific chat records as included in the rolling summary |
-| **Request body** | `{"chat_ids": [int, ...]}` |
-| **Response** | `{"status": "marked"}` |
-
----
-
-#### 7.2.5 Administration
-
-**`POST /vectordb/rebuild`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Rebuild both statute and case law FAISS indexes from the Admin API |
-| **Response** | `{"status": "rebuilt", "statute_chunks": int, "caselaw_chunks": int}` |
-| **Side effects** | Deletes all 6 index files; re-fetches all law data; re-loads stores into memory |
-
-**`POST /vectordb/rebuild-caselaws`**
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Rebuild only the case law index (non-destructive to statute index) |
-| **Response** | `{"status": "rebuilt", "caselaw_chunks": int}` |
-
----
-
-### 7.3 Ask Endpoint Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant App as app.py (FastAPI)
-    participant Search as search.py
-    participant ChatAPI as Chat API (ludexora.live)
-    participant AdminAPI as Admin API (admin.ludexora.live)
-    participant LLM as Groq LLM
-
-    Client->>App: POST /sessions/{id}/ask {"question": "..."}
-    
-    par Parallel I/O
-        App->>ChatAPI: GET /sessions/{id}/summary
-        ChatAPI-->>App: summary text
-    and
-        App->>ChatAPI: GET /sessions/{id}/chats
-        ChatAPI-->>App: recent chat list
-    end
-    
-    App->>Search: hybrid_search(question)
-    Search->>Search: FAISS semantic + BM25 keyword (statute)
-    Search->>Search: FAISS semantic + BM25 keyword (caselaw)
-    Search->>Search: CrossEncoder rerank all candidates
-    Search-->>App: top-3 statute + top-3 caselaw chunks
-    
-    loop For each statute node_id (parallel)
-        App->>AdminAPI: GET /nodes/{node_id}/law-context
-        AdminAPI-->>App: {law_text, cross_references: [...]}
-    end
-    
-    App->>LLM: chat.completions.create(system_prompt + context + question)
-    LLM-->>App: answer string
-    
-    App->>ChatAPI: POST /sessions/{id}/chats {user_message, ai_response}
-    ChatAPI-->>App: 200 OK
-    
-    App-->>Client: {"answer": "...", "full_laws": [...]}
-    
-    opt if chat count >= 5
-        App->>App: background_task: run_summarize_job(session_id)
-        App->>ChatAPI: GET /sessions/{id}/chats (unsummarized)
-        App->>LLM: generate_summary(old_summary, chats)
-        LLM-->>App: new summary
-        App->>ChatAPI: PATCH /sessions/{id}/summary
-        App->>ChatAPI: PATCH /mark-summarized {chat_ids}
-    end
-```
-
----
-
-## 8. Authentication and Authorization
-
-### 8.1 Authentication Mechanism
-
-The service uses **Bearer Token authentication** (`Authorization: Bearer <token>`) for outbound calls to both external APIs. The token is configured via the `API_TOKEN` environment variable.
-
-On startup, `client.py:check_api_token()` performs an eager validation by calling `GET /api/v1/nodes/leaf` on the Legal Admin API. A `401` response aborts startup with a `RuntimeError`, preventing the service from serving requests with an invalid token.
+### 6.7 Index Load at Startup
 
 ```python
-# client.py:18-30
-def check_api_token() -> None:
-    if not API_TOKEN:
-        raise RuntimeError("API_TOKEN is not set in .env")
-    resp = _session.get(f"{API_BASE_URL}/api/v1/nodes/leaf", timeout=10)
-    if resp.status_code == 401:
-        raise RuntimeError(f"API_TOKEN is invalid — got 401 from {API_BASE_URL}")
+# app.py startup
+if os.path.exists(INDEX_PATH):
+    load_store()          # statute index (optional — service runs without it in 503 state)
+
+load_caselaw_store()      # case law (no-op if files absent — graceful)
+load_act_store()          # act metadata (no-op if files absent)
 ```
 
-The same token header is attached to all outbound requests via the shared `requests.Session` instance:
+---
+
+## 7. Retrieval Pipeline
+
+### 7.1 Standard Hybrid Search
+
+For `explain`, `definition`, `compare`, `procedure`, and `penalty` intents:
+
+**Step 1 — Candidate retrieval (per corpus)**
+
 ```python
-# client.py:15
-_session.headers.update(AUTH_HEADERS)
+def _candidates(query, store, k):
+    # Semantic arm: FAISS inner product search
+    query_vec = embedder.encode([BGE_PREFIX + query], normalize_embeddings=True)
+    _, faiss_idx = store["index"].search(query_vec, k)
+    semantic_hits = set(faiss_idx[0].tolist())
+
+    # Keyword arm: BM25 Okapi scoring
+    bm25_scores = store["bm25"].get_scores(query.lower().split())
+    bm25_top = set(argsort(bm25_scores)[::-1][:k].tolist())
+
+    return [store["chunks"][i] for i in semantic_hits | bm25_top]
 ```
 
-### 8.2 Inbound Authentication
+Candidate sizes: `CANDIDATE_K=20` statute candidates + `CASELAW_CANDIDATE_K=15` case law candidates = up to 35 total.
 
-The Legal RAG service's own endpoints do **not implement per-request authentication**. It is assumed that:
-- The service is deployed behind a reverse proxy (e.g., nginx) or API gateway that enforces inbound authentication.
-- The service is only accessible to trusted internal callers (the frontend and the Chat API backend on `ludexora.live`).
+**Step 2 — Unified reranking**
 
-### 8.3 User Roles
+All candidates (from both corpora) are scored jointly by `BAAI/bge-reranker-base` (CrossEncoder):
 
-| Role | Access Level |
+```python
+pairs = [(query, chunk_text(c)) for c in statute_candidates + caselaw_candidates]
+scores = reranker.predict(pairs)
+ranked = sorted(zip(scores, candidates), reverse=True)
+```
+
+**Step 3 — Corpus-separated top-K selection**
+
+After unified reranking, the ranked list is split by source:
+- Statute hits: top `TOP_K=3`
+- Case law hits: top `CASELAW_TOP_K=3`
+
+This ensures both corpora contribute to the final context — a purely unified top-6 could discard all case law if statutes score higher, or vice versa.
+
+### 7.2 Context Enrichment (Statutes Only)
+
+After retrieval, statute chunks are resolved to full law text via the Admin API. The `chunk_node_id()` function extracts the `node_id` from each chunk dict, then `fetch_law_with_context(node_id)` is called in parallel (6-worker thread pool) to retrieve:
+
+- The full law text of the node (not just the matched chunk)
+- Cross-referenced nodes' full law text
+
+Deduplication ensures the same node is not fetched twice. Cross-references are fetched only if their `node_id` has not already been seen.
+
+Case law chunks are passed directly without an API call — they are already self-contained.
+
+### 7.3 Act Discovery Search
+
+For `count` and `list` intents, the act-level FAISS store is searched instead of chunk-level indexes:
+
+```python
+def act_discovery_search(query):
+    query_vec = embedder.encode([BGE_PREFIX + query], normalize_embeddings=True)
+    k = min(ACT_CANDIDATE_K, len(act_store["records"]))  # ACT_CANDIDATE_K = 50
+    scores, indices = act_store["index"].search(query_vec, k)
+
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if float(score) < ACT_SCORE_THRESHOLD:  # 0.25 — drops irrelevant acts
+            break
+        results.append({...act_record, "_score": float(score)})
+    return results
+```
+
+Then for each matching act, `evidence_for_act(query, act_id)` fetches all statute chunks belonging to that act and reranks them by CrossEncoder, returning the top `EVIDENCE_TOP_K=2` chunks as supporting evidence.
+
+### 7.4 Structural Query Lookup
+
+For `structural` intent, no FAISS or LLM is involved in retrieval. The flow is:
+
+1. `_extract_act_name(question)` — regex extracts the Act name (must end with Act/Law/Ordinance/Code/Statute and have ≥ 2 words).
+2. `_extract_node_type(question)` — maps natural-language words to DB enum values (section→SECTION, clause→SUBSECTION, part→PART, chapter→CHAPTER, etc.).
+3. `search_acts_by_title(act_name)` — Admin API title search returns up to 5 matching acts.
+4. For count queries: `fetch_act_structure_stats(act_id)` returns precomputed counts per node type.
+5. For list queries: `fetch_act_nodes_by_type(act_id, node_type)` returns ordered node list with `node_no` and `heading`.
+
+The answer is formatted deterministically by `format_structural_answer()` — a pure text-formatting function with no LLM call.
+
+### 7.5 Context Formatting Before LLM
+
+```
+[Conversation Summary]          ← only if use_history=True and summary exists
+{old summary text}
+
+[Recent Conversation]           ← only if use_history=True and recent chats exist
+User: ...
+Assistant: ...
+
+[Relevant Legal Context]
+
+[STATUTE]                       ← statute chunks tagged
+{full law text from Admin API}
+
+---
+
+[CASE LAW] {case_name}         ← case law chunks tagged inline
+{chunk text}
+
+---
+
+[Question]
+{user question}
+```
+
+---
+
+## 8. Response Generation
+
+### 8.1 Standard Explanation Pipeline
+
+`generate_answer()` in `llm.py` assembles the prompt from conversation memory, retrieved law blocks, and the question, then calls the LLM at temperature 0.2, max 1024 tokens.
+
+The system prompt constrains the LLM to:
+- Answer **only** from the provided legal context.
+- Lead with the relevant **statute provision** (the rule).
+- Use **case law** to show how courts have interpreted or applied that rule.
+- **Cite** Act name + section for statutes; case name + citation for case law.
+- Explicitly refuse if the context is insufficient — no fabrication.
+
+If `hybrid_search` returns no results, the prompt contains no `[Relevant Legal Context]` block. The LLM then has no evidence and will state it cannot determine the answer — which is the correct behaviour.
+
+### 8.2 Discovery Pipeline
+
+`generate_discovery_answer()` uses a separate system prompt:
+
+- States exact count first for count questions.
+- Lists every act with a one-line description.
+- Formats as `<number>. <Act Title> — <summary or domain>`.
+- Does NOT invent acts not in the retrieved list.
+
+If `act_discovery_search` returns no acts, the function short-circuits and returns a static "no relevant Acts found" message — no LLM call.
+
+### 8.3 Structural Pipeline
+
+`format_structural_answer()` is pure text formatting:
+- For count questions: `"The {act_label} contains {N} {sections/parts/...}."`
+- For list questions: the above plus a bulleted list `"• Section {no}: {heading}"`.
+- Error messages if act not found or stats unavailable.
+
+No LLM is called. The answer is deterministic.
+
+### 8.4 Citation Handling
+
+| Source | How cited |
 |---|---|
-| **End user** | Can call `/sessions/{id}/ask`, session CRUD, chat CRUD, history |
-| **Administrator** | Has access to `/vectordb/rebuild*` endpoints — these should be protected at the network or reverse-proxy level |
-| **Service token** | Single shared `API_TOKEN` used for all Admin API calls; no per-user token differentiation |
+| Statute | Returned in `full_laws` with `source: "statute"` and full `text`; LLM cites Act name + section in answer text |
+| Case law | Returned with `source: "caselaw"`, `case_name`, `citation`, `section_type`, `text`; LLM cites case name + citation |
+| Act discovery | Returned with `source: "act_discovery"`, `act_id`, `title`, `short_title`, `summary`, `score` |
+| Structural | Returned with `source: "structural"`, `type: "STRUCTURAL_RESULT"`, count, act metadata |
 
-### 8.4 Security Controls
+### 8.5 Handling Conflicting Sources
 
-- **Secrets in environment variables:** `API_TOKEN` and `GROQ_API_KEY` are loaded from a `.env` file; the `.env` file is listed in `.gitignore`.
-- **No SQL injection surface:** The service does not own or directly query a relational database.
-- **Input validation:** Pydantic models validate all request bodies; FastAPI enforces type coercion.
-- **Retry limits:** The HTTP adapter is configured with `total=2` retries — preventing runaway retry storms.
-- **Timeout enforcement:** All outbound HTTP calls specify explicit `timeout` values (10–30 seconds).
+The LLM receives both statutes and case law in the same prompt. The system prompt's instruction hierarchy is:
+1. Lead with the statute rule.
+2. Use case law for judicial interpretation.
 
----
+If statute and case law appear to conflict, the LLM is expected to surface both and note the distinction. There is no programmatic conflict detection — this relies on LLM reasoning.
 
-## 9. Frontend Architecture
+### 8.6 Handling Missing Information
 
-The Legal RAG service **does not include a frontend**. It is a pure backend API. The frontend is hosted separately at `https://ludexora.live` and communicates with this service and the Chat API independently. No frontend source code is present in this repository.
-
-The following can be inferred about the expected frontend from the API contract:
-- It manages user login and session creation via `POST /sessions`.
-- It calls `POST /sessions/{id}/ask` to submit questions and receive answers.
-- It renders `full_laws` returned by the ask endpoint to show citation sources.
-- It retrieves chat history via `GET /sessions/{id}/chats` and session history via `GET /history/{user_id}`.
+If retrieved context is insufficient to answer, the LLM must say so explicitly (system prompt instruction). No hallucination fallback exists. The structural pipeline handles missing acts with explicit error messages; discovery returns a static message when no acts match.
 
 ---
 
-## 10. Backend Architecture
+## 9. Session & Memory Management
 
-### 10.1 Service Structure
+### 9.1 Session Lifecycle
 
-The backend is structured as a single Python package with flat module organisation — no sub-packages or nested directories. Each module maps to a distinct layer of responsibility:
+Sessions are owned by the Chat API (`ludexora.live`). The RAG service proxies session creation and management:
+
+```
+POST /sessions           → Chat API: POST /api/chat/sessions
+PATCH /sessions/{id}/title → Chat API: PATCH /api/chat/sessions/{id}/title
+GET /history/{user_id}   → Chat API: GET /api/chat/history/{user_id}
+```
+
+### 9.2 Chat Storage
+
+After every successful answer (including refusals), the Q&A pair is stored in the Chat API as a background task via `_post_answer()`. This decouples persistence latency from the user-facing response time.
+
+### 9.3 Rolling Summarisation
+
+Conversation history is managed through a rolling summary pattern to stay within LLM context window limits:
+
+```
+After _post_answer():
+    count = fetch_chat_count(session_id)
+    if count >= SUMMARIZE_THRESHOLD (5):
+        run_summarize_job(session_id)  ← runs as BackgroundTask
+```
+
+`run_summarize_job()` workflow:
+1. Fetch current summary (may be null for first summarisation).
+2. Fetch all unsummarised chats.
+3. Call `generate_summary(old_summary, chats)` — LLM produces ≤250-word summary preserving legal provisions and case citations.
+4. PATCH session summary.
+5. PATCH mark-summarized with all processed chat IDs.
+
+### 9.4 Context Assembly at Query Time
+
+When `needs_history()` detects a history-referencing question, two I/O calls are dispatched to the Chat API concurrently with the vector search:
+
+```python
+# Parallel I/O (4-worker pool)
+f_summary = _io_executor.submit(fetch_session_summary, session_id)
+f_chats   = _io_executor.submit(fetch_unsummarized_chats, session_id)
+matched   = hybrid_search(question)          # synchronous, runs while I/O is in-flight
+summary      = f_summary.result()
+recent_chats = f_chats.result()
+```
+
+---
+
+## 10. LLM Integration
+
+### 10.1 Supported Providers
+
+| Provider | Key env var | Default model | SDK |
+|---|---|---|---|
+| Groq | `GROQ_API_KEY` | `llama-3.1-8b-instant` | OpenAI Python SDK (Groq exposes OpenAI-compatible API) |
+| Gemini | `GEMINI_API_KEY` | `gemini-flash-latest` | `google-genai` |
+
+**Auto-detection:** If `LLM_PROVIDER` is not set, the system checks for `GROQ_API_KEY` first, then `GEMINI_API_KEY`. If both are set, `LLM_PROVIDER` must be specified explicitly to avoid ambiguity.
+
+**Model override:** `LLM_MODEL` env var overrides the provider's default model.
+
+### 10.2 System Prompts
+
+**Main explanation system prompt (`_SYSTEM_PROMPT`):**
+```
+You are a precise legal assistant specialising in Sri Lankan Consumer Protection and Labour laws.
+Answer ONLY from the legal context provided.
+If the answer cannot be determined from the provided context, say so explicitly — do not guess or fabricate.
+
+Context blocks are labelled [STATUTE] or [CASE LAW]:
+• Lead your answer with the relevant STATUTE provision (the rule).
+• Use CASE LAW to show how courts have interpreted or applied that rule in practice.
+• Cite the Act name and section for statutes; cite the case name and citation for case law.
+Be concise and direct.
+```
+
+**Discovery system prompt (`_DISCOVERY_SYSTEM_PROMPT`):**
+```
+You are a precise legal assistant specialising in Sri Lankan law.
+You have been given a complete list of Acts retrieved from the legal database.
+Answer ONLY from the Acts and evidence provided — do NOT invent additional Acts.
+For count questions: state the exact number first, then list the Acts.
+For list questions: list every Act provided, with a one-line description from its summary.
+Format each Act as: '<number>. <Act Title> — <summary or domain>'
+Be concise and factual.
+```
+
+**Intent classification system prompt:**
+Zero-shot classification with 8 labels and clear disambiguation examples (particularly around `structural` vs `count`/`list`). Responds with a single label word at temperature 0.0.
+
+**Summarisation system prompt:**
+Instructs the model to produce a ≤250-word factual summary preserving specific legal provisions and case citations.
+
+**Act metadata system prompt (`metadata_gen._SYSTEM`):**
+Instructs extraction of a JSON object with `summary`, `keywords`, `legal_domains`, `regulated_activities`, `subjects` from an Act text sample. Strict JSON-only output with no markdown.
+
+### 10.3 LLM Call Parameters
+
+| Function | Temperature | Max tokens | Purpose |
+|---|---|---|---|
+| `generate_answer` | 0.2 | 1024 | Explanation answers |
+| `generate_discovery_answer` | 0.1 | 1024 | Act list narration |
+| `generate_summary` | 0.1 | 400 | Session compression |
+| `classify_intent` | 0.0 | 10 | Deterministic classification |
+| `generate_act_metadata` | 0.1 | 500 | JSON metadata extraction |
+
+### 10.4 Gemini vs Groq Dispatch
+
+The `llm_call()` function branches on `_PROVIDER`:
+
+- **Groq:** OpenAI `chat.completions.create()` — standard `messages` list with `system`, `user`, `assistant` roles.
+- **Gemini:** `genai.Client.models.generate_content()` — system prompt passed as `system_instruction`, conversation mapped to `user`/`model` roles.
+
+---
+
+## 11. Project Structure
 
 ```
 legal-rag/
-├── app.py           ← API + orchestration layer
-├── search.py        ← retrieval layer
-├── llm.py           ← generation layer
-├── client.py        ← external I/O layer
-├── ingest.py        ← ETL layer (statutes)
-├── ingest_caselaw.py← ETL layer (case law)
-├── ingest_api.py    ← ETL layer (legacy)
-├── config.py        ← configuration layer
-└── faiss_index/     ← local persistence layer
+├── app.py               ← FastAPI application: routing, orchestration, all 15 endpoints
+├── config.py            ← All constants and env bindings (loaded at import time)
+├── search.py            ← Three FAISS stores, BM25 indexes, hybrid search, act discovery search
+├── llm.py               ← Multi-provider LLM client; all prompt templates; answer/summary/metadata generation
+├── client.py            ← HTTP gateway: Admin API + Chat API; retry/pool session; summarisation job
+├── intent.py            ← LLM-based intent classification (8 labels)
+├── prompt_enhancer.py   ← Harmful query detection (regex); history-reference detection (regex)
+├── discovery.py         ← Discovery pipeline orchestrator: act search → evidence retrieval → DiscoveryResult
+├── legal_structure.py   ← Structural query pipeline: act name extraction → DB lookup → deterministic answer
+├── metadata_gen.py      ← Act-level AI metadata: LLM extraction → store in Admin API → fetch for FAISS
+├── ingest.py            ← Statute ingestion: leaf nodes → chunk → embed → FAISS + BM25
+├── ingest_caselaw.py    ← Case law ingestion: case-laws → chunk → embed → FAISS + BM25
+├── ingest_api.py        ← Legacy standalone ingestion script (superseded by ingest.py; retained)
+├── faiss_index/
+│   ├── legal.index          ← Statute FAISS index
+│   ├── chunks.pkl           ← Statute chunks
+│   ├── bm25_corpus.pkl      ← Statute BM25 corpus
+│   ├── caselaw.index        ← Case law FAISS index
+│   ├── caselaw_chunks.pkl   ← Case law chunks
+│   ├── caselaw_bm25.pkl     ← Case law BM25 corpus
+│   ├── act_meta.index       ← Act-level metadata FAISS index
+│   └── act_meta_records.pkl ← Act metadata records
+├── .env                 ← Secrets (gitignored)
+└── example .env         ← Configuration template
 ```
 
-### 10.2 Business Logic Layers
+### 11.1 Module Responsibilities
 
-| Layer | Module | Responsibility |
+| Module | Lines | Primary responsibility |
 |---|---|---|
-| API / Transport | `app.py` | HTTP routing, request/response serialisation, background task scheduling |
-| Orchestration | `app.py` (`session_ask`, `_resolve_laws`) | Pipeline coordination, parallel I/O fan-out |
-| Retrieval | `search.py` | Hybrid search, reranking |
-| Generation | `llm.py` | Prompt construction, LLM call, response extraction |
-| External I/O | `client.py` | HTTP to Chat API and Admin API |
-| ETL | `ingest.py`, `ingest_caselaw.py` | Fetch → chunk → embed → index |
-| Configuration | `config.py` | Environment-driven constants |
-
-### 10.3 Background Jobs
-
-One type of background job is implemented:
-
-**Rolling Summarisation (`run_summarize_job`)**
-- Trigger: `POST /sessions/{id}/ask` when `fetch_chat_count` returns ≥ `SUMMARIZE_THRESHOLD` (5).
-- Execution: FastAPI `BackgroundTasks` — runs in the same process, after the HTTP response is sent.
-- Steps: fetch unsummarised chats → call `generate_summary` (LLM) → patch session summary → mark chats as summarised.
-- Purpose: Compress conversation history to stay within LLM context window limits over long sessions.
-
-### 10.4 State Management
-
-The service is designed to be **stateless** with respect to user data. The only in-process state is:
-- `store` and `caselaw_store` (module-level dicts in `search.py`): Hold the loaded FAISS indexes and BM25 models in RAM. These are loaded once at startup and reloaded on index rebuild.
-- `embedder` and `reranker` (module-level in `search.py`): Singleton ML model instances shared across all requests.
+| `app.py` | ~396 | Request routing; 4-pipeline orchestration; background tasks; admin operations |
+| `client.py` | ~287 | All outbound HTTP with retry; summarisation job |
+| `legal_structure.py` | ~236 | Regex-based act/node-type extraction; DB-backed structural answers |
+| `llm.py` | ~218 | Provider abstraction; all prompt construction; LLM inference |
+| `search.py` | ~202 | Three FAISS stores; BM25 indexes; hybrid search; act discovery search; per-act evidence |
+| `metadata_gen.py` | ~144 | LLM metadata extraction; Admin API persistence; batch regeneration |
+| `prompt_enhancer.py` | ~80 | 28-pattern harm detection; 18-pattern history detection |
+| `ingest.py` | ~93 | Statute ETL pipeline |
+| `ingest_caselaw.py` | ~73 | Case law ETL pipeline |
+| `intent.py` | ~54 | LLM-based 8-label intent classification |
+| `discovery.py` | ~69 | Discovery orchestration: act search + per-act evidence |
+| `config.py` | ~39 | All constants and environment variable bindings |
+| `ingest_api.py` | ~67 | Legacy ingestion (L2 distance, non-normalised; kept as reference) |
 
 ---
 
-## 11. External Integrations
+## 12. API Documentation
 
-### 11.1 Legal Admin API (`admin.ludexora.live`)
+### 12.1 Overview
 
-**Purpose:** Source of truth for all legal content — both statutory law and case law.
+The service exposes 15 REST endpoints grouped into five areas. All request/response bodies are JSON. No inbound authentication is enforced at the application layer — the service relies on reverse-proxy or network-level access control.
 
-**Endpoints consumed:**
+### 12.2 AI Pipeline Endpoints
 
-| Endpoint | Method | Used by | Purpose |
-|---|---|---|---|
-| `/api/v1/nodes/leaf` | GET | `ingest.py`, `client.check_api_token` | Fetch all leaf law nodes for indexing; token validation |
-| `/api/v1/nodes/{node_id}/law-path` | GET | `ingest.py`, `ingest_api.py` | Full law text for a single node (index build) |
-| `/api/v1/nodes/{node_id}/law-context` | GET | `client.fetch_law_with_context` | Law text + cross-referenced nodes' law text (query time) |
-| `/api/v1/case-laws` | GET | `ingest_caselaw.py` | All active case law records for indexing |
+#### `POST /sessions/{session_id}/ask`
 
-**Authentication:** Bearer token via `AUTH_HEADERS`.
+The primary endpoint. Executes the full pipeline.
 
-### 11.2 Chat API (`ludexora.live`)
+**Path parameters:** `session_id` (string)
 
-**Purpose:** External persistence layer for all session and chat data.
+**Request body:**
+```json
+{"question": "string"}
+```
 
-**Endpoints consumed:**
+**Response:**
+```json
+{
+  "answer": "string",
+  "intent": "explain|definition|compare|procedure|penalty|structural|count|list|harmful",
+  "full_laws": [
+    {"source": "statute", "text": "string"},
+    {"source": "caselaw", "case_name": "string", "citation": "string", "section_type": "string", "text": "string"},
+    {"source": "act_discovery", "act_id": int, "title": "string", "short_title": "string", "summary": "string", "score": float},
+    {"source": "structural", "type": "STRUCTURAL_RESULT", "act_id": int, "act": "string", "short_title": "string", "node_type": "string", "count": int, "message": "string"}
+  ]
+}
+```
 
-| Endpoint | Method | Used by | Purpose |
-|---|---|---|---|
-| `/api/chat/sessions` | POST | `create_session` | Create a new session |
-| `/api/chat/sessions/{id}/title` | PATCH | `update_session_title` | Update session title |
-| `/api/chat/sessions/{id}/chats` | POST | `store_chat` | Persist a Q&A exchange |
-| `/api/chat/sessions/{id}/chats` | GET | `get_chats`, `fetch_unsummarized_chats` | Retrieve chats |
-| `/api/chat/sessions/{id}/chats` | DELETE | `clear_chats` | Delete all session chats |
-| `/api/chat/sessions/{id}/count` | GET | `fetch_chat_count` | Count chats in a session |
-| `/api/chat/sessions/{id}/summary` | GET | `fetch_session_summary` | Get rolling summary |
-| `/api/chat/sessions/{id}/summary` | PATCH | `update_session_summary` | Update rolling summary |
-| `/api/chat/mark-summarized` | PATCH | `mark_chats_summarized` | Mark chat IDs as summarised |
-| `/api/chat/history/{user_id}` | GET | `get_history` | All sessions for a user |
+**Behaviour by pipeline:**
 
-**Authentication:** Same Bearer token.
-
-### 11.3 Groq LLM API
-
-**Purpose:** Remote LLM inference provider.
-
-| Attribute | Detail |
-|---|---|
-| **Endpoint** | `https://api.groq.com/openai/v1` |
-| **SDK** | OpenAI Python SDK (Groq exposes OpenAI-compatible interface) |
-| **Model** | `llama-3.1-8b-instant` (Meta Llama 3.1, 8B parameter, instruction-tuned) |
-| **Auth** | `GROQ_API_KEY` environment variable |
-| **Parameters** | Answer: temperature 0.2, max_tokens 1024; Summary: temperature 0.1, max_tokens 400 |
-| **Called by** | `llm.generate_answer`, `llm.generate_summary` |
-
-### 11.4 Hugging Face Model Hub (Implicit)
-
-**Purpose:** Pre-trained model weights download at startup.
-
-| Model | Usage | Downloaded by |
+| Query type | `intent` value | `full_laws` content |
 |---|---|---|
-| `BAAI/bge-base-en-v1.5` | Text embedding (768-dim, normalised) | `sentence-transformers` |
-| `BAAI/bge-reranker-base` | Cross-encoder reranking | `sentence-transformers` |
+| Harmful | `"harmful"` | `[]` |
+| Structural | `"structural"` | One structural result object (or `[]` if not found) |
+| Discovery | `"count"` or `"list"` | One object per matching Act with score |
+| Standard | classified label | Statute + case law chunks |
 
-Models are cached locally by the `sentence-transformers` library after first download.
+**Side effects:** Stores Q&A in Chat API (background). Triggers summarisation if chat count ≥ 5 (background).
 
----
-
-## 12. Infrastructure and Deployment
-
-### 12.1 Hosting Architecture
-
-Based on the codebase and configuration, the system is designed for a **single-server deployment** with the following structure:
-
-- **Legal RAG service:** Python process running `uvicorn app:app` on a single Linux server.
-- **Chat API backend:** Separate service at `ludexora.live` (not in this repository).
-- **Legal Admin API:** Separate service at `admin.ludexora.live` (not in this repository).
-- **LLM:** Groq cloud (no self-hosted inference).
-
-### 12.2 Environment Configuration
-
-Deployment requires a `.env` file with:
-
-```env
-API_BASE_URL=https://admin.ludexora.live/
-CLIENT_BASE_URL=https://ludexora.live
-API_TOKEN=<shared-bearer-token>
-GROQ_API_KEY=<groq-api-key>
-```
-
-### 12.3 Runtime Dependencies
-
-```
-uvicorn        ← ASGI server
-fastapi        ← HTTP framework
-sentence-transformers ← BAAI models
-faiss-cpu      ← vector search
-rank-bm25      ← BM25 index
-langchain-text-splitters ← chunking
-openai         ← Groq SDK client
-requests       ← outbound HTTP
-python-dotenv  ← env loading
-numpy          ← array operations
-pypdf          ← PDF parsing (available but not currently used in main pipeline)
-```
-
-### 12.4 CI/CD
-
-No CI/CD configuration files (GitHub Actions, Dockerfile, `docker-compose.yml`) are present in the repository. Deployment appears to be manual.
-
-### 12.5 Deployment Diagram
-
-```mermaid
-graph TD
-    subgraph User["End User"]
-        Browser["Web Browser"]
-    end
-
-    subgraph LudexoraFrontend["ludexora.live (Frontend)"]
-        FE["Next.js / React Frontend"]
-    end
-
-    subgraph LudexoraBackend["ludexora.live (Chat API)"]
-        ChatAPI["Chat API Service"]
-        ChatDB[("Chat Database")]
-        ChatAPI --- ChatDB
-    end
-
-    subgraph LegalAdmin["admin.ludexora.live (Legal Admin API)"]
-        AdminAPI["Legal Admin API"]
-        LegalDB[("Law Database")]
-        AdminAPI --- LegalDB
-    end
-
-    subgraph RAGService["Legal RAG Server"]
-        FastAPI["FastAPI (app.py)"]
-        Search["search.py (FAISS+BM25)"]
-        LLMClient["llm.py (Groq Client)"]
-        HTTPClient["client.py (requests)"]
-        FaissIndex[("faiss_index/\n*.index\n*.pkl")]
-        FastAPI --> Search
-        FastAPI --> LLMClient
-        FastAPI --> HTTPClient
-        Search --> FaissIndex
-    end
-
-    subgraph Groq["Groq Cloud"]
-        GroqAPI["Groq LLM API\n(llama-3.1-8b-instant)"]
-    end
-
-    Browser --> FE
-    FE --> FastAPI
-    HTTPClient --> ChatAPI
-    HTTPClient --> AdminAPI
-    LLMClient --> GroqAPI
-```
+**Error response:** `503` if vector store not initialised; `503` if LLM unavailable.
 
 ---
 
-## 13. Data Flow Analysis
+### 12.3 Session Management
 
-### 13.1 User Request Flow
-
-1. **HTTP Request:** Client sends `POST /sessions/{id}/ask` with a question.
-2. **Parallel I/O:** FastAPI launches two I/O futures — fetching the session summary and unsummarised chats from the Chat API.
-3. **Hybrid Search:** Synchronously, the hybrid search runs against the in-memory FAISS and BM25 indexes.
-4. **Candidate Union:** FAISS semantic hits and BM25 keyword hits are unioned per corpus.
-5. **Reranking:** The CrossEncoder scores all candidates jointly; top-K from each corpus are selected.
-6. **Context Enrichment:** For statute chunks, `fetch_law_with_context` fetches full text + cross-references from the Admin API (parallel threads).
-7. **Prompt Assembly:** Summary + recent chats + enriched law blocks + question are assembled into a structured prompt.
-8. **LLM Call:** Groq API generates the answer.
-9. **Persistence:** The Q&A pair is stored in the Chat API.
-10. **Response:** JSON with answer and cited law blocks is returned to the client.
-11. **Background:** If chat count ≥ 5, summarisation runs asynchronously.
-
-### 13.2 Data Processing Flow
-
-```mermaid
-flowchart TD
-    Q["User Question"] --> FanOut{"Fan-out I/O"}
-    FanOut --> SumFetch["Fetch Session Summary\n(Chat API)"]
-    FanOut --> ChatFetch["Fetch Recent Chats\n(Chat API)"]
-    FanOut --> HybridSearch["Hybrid Search\n(FAISS + BM25)"]
-    
-    HybridSearch --> FAISS["FAISS Semantic\nSearch (IndexFlatIP)"]
-    HybridSearch --> BM25["BM25 Keyword\nSearch"]
-    FAISS --> Union["Union Candidates"]
-    BM25 --> Union
-    Union --> Rerank["CrossEncoder\nReranking"]
-    Rerank --> TopK["Top-K Chunks\n(3 statute + 3 caselaw)"]
-    
-    TopK --> ResolveStatute["Resolve Statute IDs\n(parallel API calls)"]
-    TopK --> PassCaselaw["Pass Caselaw Chunks\n(direct)"]
-    ResolveStatute --> AdminAPI["Admin API\n/law-context"]
-    AdminAPI --> LawText["Law Text +\nCross-References"]
-    
-    SumFetch --> Prompt
-    ChatFetch --> Prompt
-    LawText --> Prompt
-    PassCaselaw --> Prompt
-    Q --> Prompt["Assemble Prompt\n[Summary][Chats][Laws][Question]"]
-    
-    Prompt --> GroqAPI["Groq LLM\n(llama-3.1-8b-instant)"]
-    GroqAPI --> Answer["Generated Answer"]
-    Answer --> StoreChat["Store in Chat API"]
-    Answer --> Response["JSON Response\nto Client"]
-```
-
-### 13.3 Ingestion / Index Build Flow
-
-```mermaid
-flowchart TD
-    A["POST /vectordb/rebuild"] --> DelFiles["Delete old index files"]
-    DelFiles --> B["Fetch leaf nodes\nGET /api/v1/nodes/leaf"]
-    B --> C["For each node:\nGET /api/v1/nodes/node_id/law-path"]
-    C --> D["RecursiveCharacterTextSplitter\n(800 chars, 100 overlap)"]
-    D --> E["SentenceTransformer Encode\n(BAAI/bge-base-en-v1.5, normalised)"]
-    E --> F["FAISS IndexFlatIP\n(768-dim)"]
-    F --> G["Save: legal.index\nchunks.pkl\nbm25_corpus.pkl"]
-    
-    A --> H["Fetch case laws\nGET /api/v1/case-laws"]
-    H --> I["Split each case law content\n(same splitter)"]
-    I --> J["Embed with same SentenceTransformer"]
-    J --> K["FAISS IndexFlatIP\n(same dimension)"]
-    K --> L["Save: caselaw.index\ncaselaw_chunks.pkl\ncaselaw_bm25.pkl"]
-    
-    G --> M["load_store()\nload_caselaw_store()"]
-    L --> M
-    M --> N["Stores in memory"]
-```
-
-### 13.4 Rolling Summarisation Flow
-
-```mermaid
-flowchart TD
-    A["Session chat count ≥ 5"] --> B["BackgroundTask:\nrun_summarize_job(session_id)"]
-    B --> C["Fetch unsummarised chats\n(Chat API)"]
-    C --> D{"Any chats?"}
-    D -- No --> Z["Return (no-op)"]
-    D -- Yes --> E["Fetch old summary\n(Chat API)"]
-    E --> F["generate_summary(old_summary, chats)\n(LLM call, temp=0.1, max=400 tokens)"]
-    F --> G["PATCH /sessions/id/summary\n(Chat API)"]
-    G --> H["PATCH /mark-summarized\nwith chat_ids (Chat API)"]
-    H --> I["Done"]
-```
+| Method | Path | Body | Response | Purpose |
+|---|---|---|---|---|
+| POST | `/sessions` | `{user_id, title?}` | Session object | Create session in Chat API |
+| PATCH | `/sessions/{id}/title` | `{title}` | Updated session | Update session display title |
+| GET | `/history/{user_id}` | — | `{user_id, sessions: [...]}` | All sessions for a user |
 
 ---
 
-## 14. Design Patterns
+### 12.4 Chat CRUD
 
-### 14.1 Architectural Patterns
-
-| Pattern | Where Applied | Evidence |
-|---|---|---|
-| **Retrieval-Augmented Generation (RAG)** | Core system | `hybrid_search` → `_resolve_laws` → `generate_answer` pipeline in `app.py` |
-| **Layered Architecture** | Entire service | Distinct layers: API → orchestration → retrieval → generation → I/O |
-| **Pipeline** | `session_ask` | Sequential stages: retrieve → enrich → generate → store |
-| **Repository Pattern** | `client.py` | All external API interactions are encapsulated in typed functions; callers never handle HTTP directly |
-| **Service Locator / Module Singleton** | `search.py` | `store` and `caselaw_store` are module-level singletons loaded once at startup |
-
-### 14.2 Design Patterns
-
-| Pattern | Where Applied | Evidence |
-|---|---|---|
-| **Two-Stage Retrieval** | `search.py:_candidates` + `hybrid_search` | Candidate retrieval (FAISS + BM25) followed by precise CrossEncoder reranking |
-| **Sliding Window Chunking** | `ingest.py`, `ingest_caselaw.py` | `RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)` |
-| **Fan-Out / Scatter-Gather** | `app.py:session_ask` | Parallel I/O with `ThreadPoolExecutor`; results joined before proceeding |
-| **Eager Validation / Fail Fast** | `client.py:check_api_token` | Token validated at startup; service refuses to start with bad credentials |
-| **Strategy Pattern (implicit)** | `_resolve_laws` | Different resolution strategies for statute chunks vs caselaw chunks based on `source` discriminator |
-| **Template Method** | `llm.py:generate_answer`, `generate_summary` | Both functions follow the same build-prompt → call-LLM → extract-response template |
-| **Discriminated Union** | Chunk dicts | `source="caselaw"` discriminator separates two chunk types throughout the pipeline |
-| **Rolling Summary / Memory Compression** | `run_summarize_job` | LLM-based compression of conversation history to maintain context window budget |
-
-### 14.3 Best Practices
-
-- **Environment-based configuration:** All secrets and URLs in `.env`, never hardcoded. Source: `config.py:1-9`.
-- **Explicit timeouts:** Every outbound HTTP call specifies a `timeout` parameter to prevent hanging threads. Source: `client.py`.
-- **Retry with back-off:** `urllib3.Retry` handles transient gateway failures gracefully. Source: `client.py:10-14`.
-- **Normalised embeddings + IP index:** Using `normalize_embeddings=True` with `IndexFlatIP` is mathematically equivalent to cosine similarity — the correct metric for BGE models. Source: `ingest.py:33`, `search.py:65`.
-- **BGE query prefix:** Applying the model-specific instruction prefix for queries only (not at index time) follows the BGE model's intended asymmetric retrieval paradigm. Source: `search.py:22`.
-- **Background tasks:** Summarisation is offloaded to a `BackgroundTask` so the user-facing `/ask` response is not blocked. Source: `app.py:168`.
+| Method | Path | Body | Response | Purpose |
+|---|---|---|---|---|
+| POST | `/sessions/{id}/chats` | `{user_message, ai_response}` | `{status: "created"}` | Manually persist a Q&A pair |
+| GET | `/sessions/{id}/chats` | — | `{session_id, chats: [...]}` | Retrieve all chats |
+| DELETE | `/sessions/{id}/chats` | — | `{status: "cleared"}` | Delete all chats |
+| GET | `/sessions/{id}/count` | — | `{session_id, count: int}` | Count of chats |
 
 ---
 
-## 15. Non-Functional Requirements
+### 12.5 Summary Management
 
-### 15.1 Scalability
-
-**Current state:** The service is a single-process uvicorn server with no horizontal scaling mechanism. The in-memory FAISS indexes and singleton ML model instances (`embedder`, `reranker`) are not process-safe for multi-worker deployments (multiple workers would each load ~1–2 GB of model weights independently).
-
-**Mitigations present:**
-- ThreadPoolExecutor for I/O-bound tasks (law fetches, summary/chat fetches).
-- Connection pool in `client.py` (10 connections, 20 max) reuses TCP connections.
-
-**Limitations:** Scaling beyond one uvicorn worker requires either moving to multi-process with shared memory for FAISS, or replacing FAISS with a dedicated vector database service (Pinecone, Weaviate, etc.).
-
-### 15.2 Performance
-
-- **Embedding:** `BAAI/bge-base-en-v1.5` on CPU; suitable for low-to-medium query rates. GPU would offer 10–20× speedup.
-- **FAISS `IndexFlatIP`:** Exact (brute-force) search — O(n) per query. For corpus sizes typical of Sri Lankan statutes (likely hundreds to low thousands of chunks), this is acceptable.
-- **CrossEncoder reranking:** Re-scores up to CANDIDATE_K (20) + CASELAW_CANDIDATE_K (15) = 35 pairs per query on CPU — the main latency bottleneck.
-- **Parallel I/O:** `_io_executor` (4 workers) overlaps session summary and chat fetches with the synchronous vector search, hiding most external API latency.
-- **LLM latency:** Groq's `llama-3.1-8b-instant` is optimised for low-latency inference (Groq LPU hardware).
-
-### 15.3 Security
-
-- **Token management:** Single shared API token for all outbound calls. No per-user token isolation for external APIs.
-- **Inbound security:** No inbound authentication enforced at the application layer; depends on reverse proxy.
-- **Secret exposure:** `.env` file is gitignored; `example .env` in the repository uses placeholder values.
-- **No direct database access:** Eliminates SQL injection vectors.
-- **Input validation:** Pydantic enforces request body schemas.
-
-### 15.4 Reliability
-
-- **Startup validation:** `check_api_token()` prevents the service from entering a broken state silently.
-- **Graceful degradation:** Most `client.py` functions return empty collections (not exceptions) on HTTP failure — the system can continue serving requests even if the Chat API is temporarily unavailable.
-- **Retry logic:** 2 retries on 502/503/504 responses handle transient infrastructure failures.
-- **Caselaw store optional:** `load_caselaw_store()` is a no-op if index files are absent — the service starts successfully and serves statute-only results.
-
-### 15.5 Maintainability
-
-- **Single-responsibility modules:** Each file has a clear, documented purpose.
-- **No framework lock-in for core logic:** The retrieval pipeline (`search.py`) and LLM calls (`llm.py`) are framework-agnostic — neither depends on FastAPI or LangChain internals.
-- **Swappable LLM:** Using the OpenAI SDK interface means switching from Groq to OpenAI (or another OpenAI-compatible provider) requires only changing `api_key` and `base_url` in `llm.py`.
-- **Separate rebuild endpoints:** `POST /vectordb/rebuild-caselaws` allows updating case law independently of statutes, reducing rebuild time during incremental updates.
-
-### 15.6 Availability
-
-The service's availability depends on three external systems: Legal Admin API, Chat API, and Groq. The FAISS indexes are persisted to disk, so a service restart does not require an index rebuild. The lack of a health-check or readiness endpoint (`/health`) is a notable gap.
+| Method | Path | Body | Response | Purpose |
+|---|---|---|---|---|
+| GET | `/sessions/{id}/summary` | — | `{session_id, summary: string\|null}` | Retrieve rolling summary |
+| PATCH | `/sessions/{id}/summary` | `{summary}` | `{status: "updated"}` | Manually update summary |
+| PATCH | `/mark-summarized` | `{chat_ids: [int]}` | `{status: "marked"}` | Mark chats as included in summary |
 
 ---
 
-## 16. Technology Stack
+### 12.6 Administration
 
-| Category | Technology | Version (inferred) | Role |
-|---|---|---|---|
-| **Language** | Python | 3.10+ (uses `dict \| None` union type syntax) | Primary runtime |
-| **Web Framework** | FastAPI | Latest stable | HTTP API and request routing |
-| **ASGI Server** | Uvicorn | Latest stable | Production HTTP server |
-| **Data Validation** | Pydantic | v2 (`model_dump`) | Request/response schema validation |
-| **Vector Database** | FAISS (`faiss-cpu`) | Latest stable | Dense vector approximate nearest neighbour search |
-| **Sparse Retrieval** | `rank-bm25` | Latest stable | BM25 lexical search (Okapi BM25 variant) |
-| **Embedding Model** | BAAI/bge-base-en-v1.5 | — | 768-dim sentence embeddings for asymmetric retrieval |
-| **Reranker Model** | BAAI/bge-reranker-base | — | CrossEncoder pairwise relevance scoring |
-| **ML Framework** | `sentence-transformers` | Latest stable | Model loading, encoding, cross-encoder inference |
-| **Numerical Computing** | NumPy | Latest stable | Embedding array operations, BM25 score sorting |
-| **Text Chunking** | LangChain Text Splitters (`langchain-text-splitters`) | Latest stable | Recursive character-based text splitting |
-| **LLM Provider** | Groq API | — | Remote LLM inference |
-| **LLM Model** | Meta Llama 3.1 8B Instant | — | Answer generation and summarisation |
-| **LLM SDK** | OpenAI Python SDK | Latest stable | OpenAI-compatible API client (reused for Groq) |
-| **HTTP Client** | `requests` + `urllib3` | Latest stable | Outbound API calls with retry and connection pooling |
-| **Configuration** | `python-dotenv` | Latest stable | `.env` file loading |
-| **Index Serialisation** | Python `pickle` | stdlib | Chunk and BM25 corpus persistence |
-| **Version Control** | Git / GitHub | — | Source control; 9 merged PRs |
+#### `POST /vectordb/rebuild-statutes`
+
+Rebuilds only the statute FAISS index. Does not touch case law or act metadata indexes.
+
+**Response:** `{"status": "rebuilt", "statute_chunks": int}`
+
+#### `POST /vectordb/rebuild-caselaws`
+
+Rebuilds only the case law FAISS index. Non-destructive to statute and act-metadata indexes.
+
+**Response:** `{"status": "rebuilt", "caselaw_chunks": int}`
+
+#### `POST /vectordb/rebuild-act-metadata`
+
+Regenerates AI metadata for all Acts (LLM calls) and rebuilds the act-level FAISS index. Does not touch statute or case-law indexes.
+
+**Response:** `{"status": "rebuilt", "acts_generated": int, "acts_indexed": int}`
+
+#### `POST /vectordb/warm-structure-cache`
+
+Triggers the Legal Admin API to recompute and cache `act_statistics` for every active Act. Call after a statute rebuild to pre-warm structural query responses.
+
+**Response:** `{"status": "warmed", "acts_refreshed": int}`
 
 ---
 
-## 17. System Workflow
-
-### 17.1 User Query Workflow
-
-A user submits a legal question through the frontend. The RAG pipeline retrieves relevant statutory provisions and case law, enriches them with cross-references, and generates a grounded answer citing specific laws and cases.
-
-**Activity Diagram:**
-
-```mermaid
-flowchart TD
-    Start([User submits question]) --> API[API receives POST /sessions/id/ask]
-    API --> RequireStore{Vector store loaded?}
-    RequireStore -- No --> E503[Return 503 Service Unavailable]
-    RequireStore -- Yes --> ParIO[Parallel: fetch summary + recent chats]
-    ParIO --> Search[hybrid_search: FAISS + BM25 → CrossEncoder]
-    Search --> AnyResults{Any results?}
-    AnyResults -- No --> NoCtx[Prompt with no context → LLM says 'cannot determine']
-    AnyResults -- Yes --> Resolve[_resolve_laws: fetch statute texts + cross-refs]
-    NoCtx --> LLMCall
-    Resolve --> LLMCall[generate_answer: Groq API call]
-    LLMCall --> StoreChat[store_chat in Chat API]
-    StoreChat --> CountCheck{count >= 5?}
-    CountCheck -- No --> Return[Return answer + laws]
-    CountCheck -- Yes --> BGSummarise[BackgroundTask: run_summarize_job]
-    BGSummarise --> Return
-    Return --> End([Client receives JSON response])
-```
-
-### 17.2 Index Build Workflow
-
-```mermaid
-flowchart TD
-    Admin([Admin calls POST /vectordb/rebuild]) --> DelStatute[Delete statute index files]
-    DelStatute --> DelCaselaw[Delete caselaw index files]
-    DelCaselaw --> ClearMem[Clear in-memory stores]
-    ClearMem --> FetchLeaf[Fetch leaf nodes from Admin API]
-    FetchLeaf --> FetchLaws[Fetch law text per node]
-    FetchLaws --> ChunkStatute[Split into 800-char chunks with 100 overlap]
-    ChunkStatute --> EmbedStatute[Embed with BAAI/bge-base-en-v1.5]
-    EmbedStatute --> FaissStatute[Build IndexFlatIP + save BM25 corpus]
-    
-    ClearMem --> FetchCases[Fetch case laws from Admin API]
-    FetchCases --> ChunkCaselaw[Split case content into chunks]
-    ChunkCaselaw --> EmbedCaselaw[Embed with same model]
-    EmbedCaselaw --> FaissCaselaw[Build caselaw IndexFlatIP + save BM25 corpus]
-    
-    FaissStatute --> Reload[load_store + load_caselaw_store]
-    FaissCaselaw --> Reload
-    Reload --> Done([Return rebuilt chunk counts])
-```
-
-### 17.3 Rolling Summarisation Workflow
+### 12.7 Ask Endpoint Request Sequence
 
 ```mermaid
 sequenceDiagram
-    participant BG as BackgroundTask
-    participant ChatAPI as Chat API
-    participant LLM as Groq LLM
+    participant C as Client
+    participant A as app.py
+    participant PE as prompt_enhancer
+    participant IN as intent.py
+    participant S as search.py
+    participant CA as Chat API
+    participant AA as Admin API
+    participant L as LLM
 
-    BG->>ChatAPI: GET /sessions/{id}/summary
-    ChatAPI-->>BG: old_summary (or null)
-    BG->>ChatAPI: GET /sessions/{id}/chats
-    ChatAPI-->>BG: unsummarized chat list
-    BG->>LLM: generate_summary(old_summary, chats)
-    Note over LLM: System: "legal session summariser"\nmax 250 words, preserve citations
-    LLM-->>BG: new_summary
-    BG->>ChatAPI: PATCH /sessions/{id}/summary {summary: new_summary}
-    BG->>ChatAPI: PATCH /mark-summarized {chat_ids: [...]}
-```
-
-### 17.4 Component Diagram
-
-```mermaid
-graph LR
-    subgraph RAG ["Legal RAG Service"]
-        APP["app.py\n(FastAPI Router)"]
-        SEARCH["search.py\n(Hybrid Retrieval)"]
-        LLM["llm.py\n(LLM Client)"]
-        CLIENT["client.py\n(HTTP Gateway)"]
-        INGEST["ingest.py\n(ETL Statutes)"]
-        INGESTCL["ingest_caselaw.py\n(ETL Case Laws)"]
-        CONFIG["config.py\n(Configuration)"]
-        FAISSIDX[("faiss_index/\nVector Stores")]
+    C->>A: POST /sessions/{id}/ask
+    A->>PE: is_harmful_query(question)
+    alt harmful
+        PE-->>A: True
+        A-->>C: {"answer": refusal, "intent": "harmful"}
+    else safe
+        A->>IN: classify_intent(question) via LLM
+        IN-->>A: intent label
+        alt structural
+            A->>AA: search_acts_by_title + structure stats/nodes
+            AA-->>A: act + structure data
+            A-->>C: {"answer": formatted_text, "intent": "structural"}
+        else discovery
+            A->>S: act_discovery_search(question)
+            S-->>A: ranked act records
+            A->>S: evidence_for_act(query, act_id) per act
+            A->>L: generate_discovery_answer()
+            L-->>A: narration
+            A-->>C: {"answer": ..., "intent": "count|list"}
+        else standard
+            par Parallel I/O
+                A->>CA: fetch_session_summary
+                A->>CA: fetch_unsummarized_chats
+            and
+                A->>S: hybrid_search(question)
+            end
+            loop statute chunks (parallel, 6 workers)
+                A->>AA: fetch_law_with_context(node_id)
+            end
+            A->>L: generate_answer(question, laws, summary, chats)
+            L-->>A: answer
+            A-->>C: {"answer": ..., "intent": ..., "full_laws": [...]}
+        end
+        A->>CA: store_chat (background)
+        opt chat count >= 5
+            A->>A: run_summarize_job (background)
+        end
     end
-
-    subgraph EXT ["External Systems"]
-        ADMINAPI["Legal Admin API\nadmin.ludexora.live"]
-        CHATAPI["Chat API\nludexora.live"]
-        GROQ["Groq LLM\napi.groq.com"]
-        HF["HuggingFace\nModel Hub"]
-    end
-
-    APP --> SEARCH
-    APP --> LLM
-    APP --> CLIENT
-    APP --> INGEST
-    APP --> INGESTCL
-    SEARCH --> FAISSIDX
-    INGEST --> FAISSIDX
-    INGESTCL --> FAISSIDX
-    CLIENT --> ADMINAPI
-    CLIENT --> CHATAPI
-    CLIENT --> LLM
-    LLM --> GROQ
-    SEARCH -.->|"model weights"| HF
-    CONFIG --> APP
-    CONFIG --> SEARCH
-    CONFIG --> CLIENT
-    CONFIG --> INGEST
-    CONFIG --> INGESTCL
 ```
 
 ---
 
-## 18. Thesis Documentation Section
+## 13. Configuration
 
-### 18.1 System Analysis
+### 13.1 Environment Variables
 
-The Legal RAG system addresses a well-established information retrieval challenge in the legal domain: the semantic gap between how laypersons articulate legal queries and how legal text is formally structured. Traditional keyword search systems fail to bridge this gap because legal provisions often do not contain the colloquial terms users employ. Pure semantic search, while capable of bridging vocabulary gaps, can miss exact statutory terminology that BM25-style keyword matching would catch reliably.
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `API_BASE_URL` | No | `http://127.0.0.1:8001` | Legal Admin API base URL |
+| `CLIENT_BASE_URL` | No | `https://ludexora.live` | Chat API base URL |
+| `API_TOKEN` | **Yes** | — | Bearer token for both external APIs (startup will abort without this) |
+| `GROQ_API_KEY` | Yes (if Groq) | — | Groq API key; auto-selects Groq provider |
+| `GEMINI_API_KEY` | Yes (if Gemini) | — | Gemini API key; auto-selects Gemini provider |
+| `LLM_PROVIDER` | No | Auto-detect | Force provider: `groq` or `gemini` |
+| `LLM_MODEL` | No | Provider default | Override LLM model (e.g. `llama-3.1-70b-versatile`) |
+| `ACT_SCORE_THRESHOLD` | No | `0.25` | Minimum cosine similarity to include an Act in discovery results |
 
-The system analysis reveals that this service occupies a specific niche within the legal technology (LegalTech) landscape: it is a grounded question-answering system rather than a document retrieval system. Unlike systems that return a list of potentially relevant documents, this service synthesises retrieved content into a coherent, citation-backed answer. This design decision trades the precision and verifiability of traditional document retrieval for the accessibility and directness of natural-language answers.
+### 13.2 Model Configuration
 
-The dual-corpus design (statutes + case law) reflects a fundamental distinction in common law legal systems: statutes provide the formal rule, while case law illuminates how courts have interpreted and applied that rule. By integrating both, the system offers a richer understanding of the law than either corpus alone could provide.
-
-### 18.2 System Design
-
-The system is designed around three principles:
-
-1. **Grounding over generation:** The LLM is constrained to answer only from the retrieved context, with an explicit system prompt instruction to refuse answering when the context is insufficient. This is enforced at the prompt level (`llm.py:12-19`) rather than technically, which means it relies on model instruction-following. Temperature 0.2 for answers and 0.1 for summaries further reduce hallucination risk by keeping outputs close to the input distribution.
-
-2. **Hybrid retrieval over single-method retrieval:** The two-stage pipeline (FAISS + BM25 candidates → CrossEncoder reranking) is theoretically motivated: dense retrieval excels at semantic similarity while sparse retrieval captures exact term matches; the cross-encoder reranker, having access to both query and passage jointly, produces more accurate relevance scores than either retrieval model alone. This approach is consistent with the "retrieve and rerank" paradigm established in academic literature (Nogueira et al., 2019; Karpukhin et al., 2020).
-
-3. **Externalised state:** By delegating all persistent state (sessions, chats, law content) to external APIs, the RAG service remains stateless and independently deployable. This design choice, while creating a dependency on two external systems, enables clean separation of concerns and allows the retrieval/generation logic to evolve independently of the data persistence layer.
-
-### 18.3 Architectural Decisions
-
-**Decision 1: FAISS over a managed vector database**
-
-The system uses local FAISS binary files instead of a cloud vector database (Pinecone, Weaviate, Qdrant). This choice prioritises simplicity and cost — no additional managed service is required — at the expense of scalability and replication. For a research system with a bounded legal corpus size, this is an appropriate trade-off.
-
-**Decision 2: Groq with `llama-3.1-8b-instant` over GPT-4**
-
-The `llama-3.1-8b-instant` model on Groq hardware offers very low inference latency (Groq's LPU architecture) at a lower cost than OpenAI's GPT-4 family. The legal domain's structured nature (the answer must come from retrieved context) reduces the need for the parametric knowledge that larger models carry, making the 8B model a pragmatic choice.
-
-**Decision 3: Hand-coded pipeline over LangChain agents**
-
-The explicit architecture decision to avoid LangChain agent abstractions (`memory/project_overview.md`) produces a more transparent, debuggable, and controllable pipeline. Each step in the retrieve-enrich-generate flow is a direct Python function call with explicit inputs and outputs, making it straightforward to inspect, test, or replace any stage.
-
-**Decision 4: Rolling summarisation over full history**
-
-Passing the full chat history to the LLM would eventually exhaust the model's context window and increase inference cost linearly with session length. The rolling summarisation approach compresses prior exchanges into a ~250-word summary while retaining recent, unsummarised exchanges verbatim. This maintains conversational coherence at bounded context cost.
-
-**Decision 5: Separate indexes for statutes and case law**
-
-Statutes and case law have different retrieval semantics and different downstream handling (statutes require law-context API enrichment; case law is self-contained). Maintaining separate indexes and search configurations (different `CANDIDATE_K` values) allows fine-grained tuning of recall for each corpus.
-
-### 18.4 Implementation Approach
-
-The implementation follows a bottom-up module decomposition:
-1. **Configuration first** (`config.py`): All constants and environment variables centralised.
-2. **ETL scripts next** (`ingest.py`, `ingest_caselaw.py`): Build the knowledge base independently of the server.
-3. **Search engine** (`search.py`): Pure retrieval logic, no FastAPI dependency.
-4. **LLM integration** (`llm.py`): Pure generation logic, no retrieval dependency.
-5. **External gateway** (`client.py`): All HTTP calls isolated from business logic.
-6. **Orchestrator** (`app.py`): Wires all modules together, exposed as HTTP endpoints.
-
-This layered bottom-up approach ensures each layer can be tested and reasoned about independently.
-
-### 18.5 Advantages of the Chosen Architecture
-
-1. **Factual grounding:** Constraining LLM output to retrieved context dramatically reduces hallucination — critical in a legal context where incorrect citations could mislead users.
-2. **Transparency:** Returning `full_laws` in the API response allows clients to display source citations, enabling users to verify the answer against the original statute or case.
-3. **Modularity:** The five-layer architecture allows replacement of any component (e.g., switching FAISS to Chroma, or Groq to OpenAI) with minimal code changes.
-4. **Dual-corpus retrieval:** The combined statute + case law context gives the LLM both the rule and its judicial interpretation, producing more legally complete answers.
-5. **Cost efficiency:** CPU inference for embedding and reranking, Groq for fast cheap LLM inference, and no managed vector database keep operational costs low.
-
-### 18.6 Limitations
-
-1. **Single-process bottleneck:** CPU-based embedding inference becomes a bottleneck under concurrent load. The CrossEncoder reranker is particularly expensive per query.
-2. **Index staleness:** FAISS indexes are static snapshots. When new laws are enacted or case law is added, the index must be manually rebuilt via `/vectordb/rebuild`. There is no incremental update mechanism.
-3. **No authentication at service boundary:** The RAG service's own endpoints are unauthenticated at the application layer, relying on infrastructure-level protection.
-4. **Single shared token:** All users share one API token for external API calls, preventing per-user rate limiting or audit logging by the external services.
-5. **No caching layer:** Repeated identical questions trigger full retrieval + LLM inference cycles. A query cache (e.g., exact-match or semantic cache) would reduce latency and cost for common questions.
-6. **Chunking information loss:** Hard chunking at 800 characters with 100-character overlap may split statutory provisions mid-sentence, degrading retrieval quality for provisions longer than one chunk.
-7. **LLM instruction-following dependence:** The grounding guarantee depends entirely on the LLM following the system prompt. More advanced constraint mechanisms (output parsing, retrieval verification) are not implemented.
-8. **No observability:** There are no structured logs, metrics endpoints, or tracing instrumentation. Debugging production issues requires reviewing raw `print()` statements.
-
-### 18.7 Future Improvements
-
-1. **GPU deployment:** Moving embedding and reranking to a CUDA-capable GPU would reduce per-query latency by an order of magnitude.
-2. **Approximate nearest neighbour:** Replacing `IndexFlatIP` with `IndexIVFFlat` or `IndexHNSW` would enable sublinear search time as the corpus grows.
-3. **Incremental index updates:** Implementing an upsert mechanism for new law nodes and case laws would eliminate the need for full rebuilds.
-4. **Per-user authentication:** Issuing per-user API tokens would enable audit trails and per-user rate limiting.
-5. **Query caching:** A semantic cache (embedding-based similarity lookup of past queries) would serve repeated questions without re-running the full pipeline.
-6. **Hallucination detection:** Adding a post-generation verification step (e.g., NLI-based entailment check against retrieved context) would provide a technical grounding guarantee beyond prompt instructions.
-7. **Health and readiness endpoints:** A `/health` endpoint returning index status, model load status, and external API reachability would enable proper Kubernetes-style lifecycle management.
-8. **Structured logging:** Replacing `print()` with a structured logger (e.g., `structlog`) and adding request IDs, latency metrics, and retrieval quality signals would enable production observability.
-9. **Multi-lingual support:** Sri Lanka has Sinhala and Tamil-speaking populations. Extending the embedding model to support multilingual queries would broaden the system's reach.
-10. **Evaluation framework:** Implementing a retrieval evaluation suite (MRR, NDCG against a labelled legal QA dataset) would enable systematic measurement of retrieval quality improvements.
-
----
-
-## 19. Code Metrics
-
-| Metric | Value | Source |
+| Constant | Value | Source |
 |---|---|---|
-| **Total Python source files** | 7 (+ 1 legacy: `ingest_api.py`) | `find *.py` |
-| **Total lines of code** | 894 | `wc -l *.py` |
-| **API endpoints (this service)** | 13 | `app.py` routes |
-| **External API endpoints consumed** | 14 | `client.py` functions |
-| **Pydantic models** | 6 | `app.py:51-75` |
-| **ThreadPoolExecutor pools** | 2 | `app.py:77, 148` |
-| **Vector index files** | 6 | `faiss_index/` directory |
-| **LLM functions** | 2 (`generate_answer`, `generate_summary`) | `llm.py` |
-| **External service dependencies** | 3 (Legal Admin API, Chat API, Groq) | `client.py`, `llm.py` |
-| **Pre-trained ML models** | 2 (embedder + reranker) | `search.py:16-17` |
-| **Git commits** | 16 | `git log` |
-| **Merged pull requests** | 9 | `git log` |
-| **Configuration constants** | 12 | `config.py` |
+| Embedding model | `BAAI/bge-base-en-v1.5` | `search.py:18` (hardcoded) |
+| Reranker model | `BAAI/bge-reranker-base` | `search.py:19` (hardcoded) |
+| Default Groq model | `llama-3.1-8b-instant` | `llm.py:8` |
+| Default Gemini model | `gemini-flash-latest` | `llm.py:13` |
 
-### 19.1 Complexity Observations
+### 13.3 Retrieval Constants
 
-- `app.py` is the most complex module (281 lines, 13 endpoints, 2 thread pools) and serves as the system's composition root. It has the highest coupling.
-- `client.py` (217 lines) is the widest module in terms of external surface area — 15 functions, 14 distinct API calls.
-- `search.py` (89 lines) achieves the most algorithmic work per line — implementing the full hybrid retrieval pipeline concisely.
-- `llm.py` (89 lines) has the highest impact-to-size ratio — its system prompt defines the entire behaviour contract with the LLM.
-- No module exceeds 281 lines, reflecting the thin-wrapper philosophy.
-- Cyclomatic complexity is low throughout; the most complex function is `_resolve_laws` in `app.py` which branches on chunk type, parallelises HTTP calls, and deduplicates results.
+| Constant | Value | Description |
+|---|---|---|
+| `CANDIDATE_K` | 20 | Statute candidates from FAISS + BM25 before reranking |
+| `TOP_K` | 3 | Final statute results after reranking |
+| `CASELAW_CANDIDATE_K` | 15 | Case law candidates before reranking |
+| `CASELAW_TOP_K` | 3 | Final case law results after reranking |
+| `ACT_CANDIDATE_K` | 50 | Max acts retrieved from act-level FAISS index |
+| `ACT_SCORE_THRESHOLD` | 0.25 | Cosine score below which acts are dropped from discovery |
+| `EVIDENCE_TOP_K` | 2 | Statute chunks retrieved per act for discovery evidence |
+| `SUMMARIZE_THRESHOLD` | 5 | Chat count that triggers background session summarisation |
 
----
+### 13.4 Vector Database File Paths
 
-## 20. Conclusion
+All paths are relative to the project root:
 
-The Legal RAG system is a well-architected, modular Python microservice that applies state-of-the-art information retrieval and natural language generation techniques to a practically important problem: democratising access to Sri Lankan Consumer Protection and Labour law.
-
-Its core technical contribution is the **hybrid two-stage retrieval pipeline** — unioning FAISS semantic search with BM25 keyword matching and then reranking with a cross-encoder — applied over a **dual corpus** of statutes and case law. This pipeline design is theoretically grounded, practically efficient for the target corpus scale, and produces results that are richer than any single retrieval method would yield.
-
-The system demonstrates sound software engineering principles: separation of concerns across clearly delineated modules, externalisation of all persistent state, fail-fast startup validation, concurrent I/O to mask external API latency, and a rolling summarisation strategy to maintain bounded conversation memory.
-
-The key architectural trade-offs — FAISS over managed vector databases, a hand-coded pipeline over agent frameworks, CPU inference over GPU — are all consistent with the research and cost constraints of the project context. The most significant technical limitations (single-process bottleneck, no incremental index update, lack of observability) are well-understood and represent natural next steps on a clear improvement path.
-
-The system achieves its primary goal — a grounded, citation-backed, conversational legal assistant — with approximately 900 lines of focused Python code, validating the value of a deliberately minimal, well-structured design.
+```
+faiss_index/
+├── legal.index          (INDEX_PATH)
+├── chunks.pkl           (CHUNKS_PATH)
+├── bm25_corpus.pkl      (BM25_CORPUS_PATH)
+├── caselaw.index        (CASELAW_INDEX_PATH)
+├── caselaw_chunks.pkl   (CASELAW_CHUNKS_PATH)
+├── caselaw_bm25.pkl     (CASELAW_BM25_PATH)
+├── act_meta.index       (ACT_INDEX_PATH)
+└── act_meta_records.pkl (ACT_RECORDS_PATH)
+```
 
 ---
 
-*Document generated from source files: `app.py`, `config.py`, `search.py`, `llm.py`, `client.py`, `ingest.py`, `ingest_caselaw.py`, `ingest_api.py`, `requirements.txt`, `example .env`, `.gitignore`.*  
-*Git history: commits `bcb1fa9` through `285046f`.*
+## 14. Performance Optimizations
+
+### 14.1 Parallel I/O (ThreadPoolExecutors)
+
+Two thread pools are maintained at module level in `app.py`:
+
+- **`_law_executor` (6 workers):** Parallel `fetch_law_with_context()` calls per statute chunk at query time.
+- **`_io_executor` (4 workers):** Parallel fetch of session summary + unsummarised chats, overlapping with synchronous vector search.
+
+Statute cross-reference fetches use `as_completed()` — the pipeline doesn't wait for the slowest fetch before processing what's ready.
+
+### 14.2 Selective History Fetching
+
+`needs_history()` regex gates whether the Chat API is called at all for session context. Self-contained questions skip 2 network round-trips entirely.
+
+### 14.3 Connection Pooling and Retry
+
+`client.py` uses a single `requests.Session` with:
+- Connection pool: 10 connections, 20 max pool size.
+- Retry policy: `total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504]`.
+
+TCP connections to both external APIs are reused across requests.
+
+### 14.4 Background Task Offloading
+
+Chat persistence (`store_chat`) and rolling summarisation (`run_summarize_job`) both run as FastAPI `BackgroundTasks` — after the HTTP response is sent. The client receives the answer without waiting for Chat API writes or LLM summarisation to complete.
+
+### 14.5 Model Singleton
+
+`embedder` and `reranker` are module-level singletons in `search.py`, loaded once at startup and shared across all requests. There is no per-request model loading.
+
+### 14.6 Graceful Index Absence
+
+`load_caselaw_store()` and `load_act_store()` are no-ops if their files are absent. The service starts and serves what indexes exist. `require_store()` returns 503 only if the statute index (the primary corpus) is missing.
+
+### 14.7 Act Metadata Skip-Existing
+
+During incremental metadata generation (`skip_existing=True`), acts that already have stored metadata are skipped. Only new acts require LLM calls during a rebuild, saving inference cost.
+
+### 14.8 Caching
+
+There is no query-level cache. Repeated identical questions trigger full retrieval and LLM inference.
+
+### 14.9 Rate Limiting
+
+No rate limiting is implemented at the application layer. Groq and Gemini have their own API rate limits; the service will surface their 429/503 responses as 503s to the caller.
+
+---
+
+## 15. Security
+
+### 15.1 Input Validation
+
+All request bodies are Pydantic models. FastAPI enforces types before any application logic:
+- `Question(question: str)` — ensures question is a non-null string.
+- `SessionCreate(user_id: str, title: Optional[str])` — typed session creation.
+- `MarkSummarized(chat_ids: list[int])` — typed list of integer IDs.
+- `ChatCreate`, `TitleUpdate`, `SummaryUpdate` — all typed.
+
+Path parameters (`session_id`, `user_id`) are passed through to external APIs as-is but are URL-encoded by the `requests` library, preventing path injection.
+
+### 15.2 Prompt Injection Mitigation
+
+The harmful-query detection layer (`prompt_enhancer.is_harmful_query`) is applied to the raw user input before the question ever reaches the LLM. This is a regex-based pre-filter — it does not rely on the LLM to detect harm.
+
+For the LLM calls themselves, user input is always placed in the `user` role message, never injected into the system prompt. The system prompt is a static constant. This structural separation reduces the risk of prompt injection attacks that attempt to override system instructions.
+
+### 15.3 Retrieval Safeguards
+
+Retrieved legal text is assembled as context blocks and passed verbatim to the LLM. The user cannot influence what is retrieved — the retrieval is driven entirely by semantic similarity and BM25 scoring against the question.
+
+Cross-reference fetches use `node_id` values extracted from pre-built index files (not user input), so there is no user-controlled parameter in Admin API URLs at query time.
+
+### 15.4 Secrets Management
+
+- `API_TOKEN`, `GROQ_API_KEY`, `GEMINI_API_KEY` are loaded from `.env` via `python-dotenv`.
+- `.env` is gitignored; only `example .env` (with placeholder values) is in the repository.
+- All outbound API calls attach the token via a shared session header, not via URL query parameters.
+- Token validated at startup; startup aborts on missing or invalid token.
+
+### 15.5 Inbound Access Control
+
+The RAG service's own endpoints have no application-level authentication. The expected deployment model is:
+- The service is deployed behind a reverse proxy (nginx/Caddy) accessible only from trusted internal callers.
+- Admin endpoints (`/vectordb/*`) should be additionally restricted at the network or proxy level.
+
+### 15.6 No Direct Database Exposure
+
+The RAG service does not own or directly query any relational database. All structured data access is mediated by the Legal Admin API and Chat API, both of which implement their own access controls. This eliminates SQL injection attack vectors.
+
+### 15.7 Sensitive Data Handling
+
+Session and chat data is stored in the external Chat API. The RAG service holds this data only transiently during request processing (in local Python objects). No user data is written to disk.
+
+---
+
+## 16. Current Limitations
+
+### 16.1 Known Limitations
+
+**Single-process bottleneck.** CPU-based embedding and CrossEncoder reranking are the primary latency bottleneck. The singleton model instances are not shareable across `uvicorn` workers; running multiple workers would load duplicate model weights. Practical throughput is one concurrent reranking operation.
+
+**No incremental index update.** FAISS indexes are full-rebuild-only. When a new statute or case law is added to the Legal Admin API, the corresponding index must be manually rebuilt via the admin endpoint. There is no upsert or partial-rebuild mechanism.
+
+**Index staleness risk.** Between rebuilds, the RAG system answers from a snapshot of the law that may not reflect recent amendments or newly registered case law.
+
+**No inbound authentication.** Admin endpoints (`/vectordb/rebuild-*`, `/vectordb/warm-structure-cache`) are not authenticated at the application layer. Any caller who can reach the service can trigger expensive rebuild operations.
+
+**Single shared API token.** All requests to the Legal Admin API and Chat API use one shared bearer token. There is no per-user token differentiation, preventing per-user audit logging or rate limiting by the external services.
+
+**No observability.** Logging is via `print()` statements. There are no structured logs, metrics endpoints, request IDs, or distributed tracing. Diagnosing production issues requires parsing stdout.
+
+**No health/readiness endpoint.** There is no `/health` or `/ready` route. Deployment orchestrators cannot distinguish a starting service (indexes loading) from a running service (indexes ready).
+
+**Harmful query detection is purely lexical.** The 28 regex patterns catch explicit phrasing of harmful intent, but semantically equivalent rephrasing using legal euphemisms or indirect language may bypass detection. No semantic harm classification is performed.
+
+**Chunking splits provisions.** Hard character-based chunking at 800 characters with 100-character overlap may split a multi-paragraph statutory provision across chunk boundaries, degrading retrieval quality for long provisions.
+
+**Intent classification is LLM-dependent.** Every question incurs one LLM call solely for intent classification (temperature 0.0, max 10 tokens). This adds latency and cost. On rare provider failures, the system falls back to `"explain"`, which may route structural or discovery queries through the wrong pipeline.
+
+**No query caching.** Repeated identical questions trigger full retrieval + LLM inference. Common questions ("What is the Consumer Affairs Authority Act?") have no cached response.
+
+**No streaming.** The `/ask` endpoint returns a complete JSON response. Long LLM answers are not streamed to the client.
+
+**Grounding is prompt-enforced only.** The guarantee that the LLM answers only from retrieved context depends on the LLM following the system prompt. No post-generation verification (e.g., NLI-based entailment check against retrieved passages) is performed.
+
+### 16.2 Edge Cases
+
+- If the `act_store` is empty or unloaded when a `count`/`list` intent is detected, the system falls through to the standard hybrid search pipeline, which is not designed for discovery queries.
+- If `search_acts_by_title` returns no matches for a structural query, the system returns an error message (not an exception) and logs nothing.
+- If both Groq and Gemini keys are set but `LLM_PROVIDER` is unset, whichever key the auto-detection loop encounters first (Groq) wins — silently.
+- The statute index is required for the standard pipeline (`require_store()` raises 503 if absent), but the case law and act-metadata indexes are optional — their absence silently degrades retrieval quality rather than failing explicitly.
+
+### 16.3 Planned Improvements (as inferred from design gaps)
+
+1. **GPU inference** — Moving embedding and reranking to CUDA would reduce per-query latency by ~10–20×.
+2. **Approximate nearest-neighbour** — Replacing `IndexFlatIP` with `IndexIVFFlat` or `IndexHNSW` would enable sublinear search as corpus size grows.
+3. **Incremental index updates** — Upsert mechanism to add new law nodes without full rebuild.
+4. **Per-request authentication** — Issue per-user or per-client tokens to enable audit logging and rate limiting.
+5. **Query caching** — Semantic cache (embedding-based lookup of past queries) for common questions.
+6. **Structured logging** — Replace `print()` with a structured logger (`structlog`) with request IDs and latency metrics.
+7. **Health endpoint** — `/health` returning index readiness, model load status, and external API reachability.
+8. **Semantic harm detection** — Complement regex patterns with a semantic classifier for indirect or euphemistic harmful intent.
+9. **Streaming responses** — Server-sent events for long LLM answers.
+10. **Multi-lingual support** — Sinhala and Tamil query support for broader reach within Sri Lanka.
+
+---
+
+## Appendix: Technology Stack
+
+| Category | Technology | Role |
+|---|---|---|
+| Language | Python 3.10+ | Primary runtime (`dict \| None` union syntax) |
+| Web framework | FastAPI | HTTP API and async request routing |
+| ASGI server | Uvicorn | Production HTTP server |
+| Data validation | Pydantic v2 | Request/response schema enforcement |
+| Vector search | `faiss-cpu` — `IndexFlatIP` | Dense ANN search (cosine similarity via IP on normalised vectors) |
+| Sparse retrieval | `rank-bm25` — `BM25Okapi` | Keyword-based lexical search |
+| Embedding model | `BAAI/bge-base-en-v1.5` | 768-dim asymmetric retrieval embeddings |
+| Reranker model | `BAAI/bge-reranker-base` | CrossEncoder pairwise relevance scoring |
+| ML framework | `sentence-transformers` | Model loading, encoding, cross-encoder inference |
+| Numerical computing | NumPy | Embedding arrays, BM25 score sorting |
+| Text chunking | `langchain-text-splitters` | `RecursiveCharacterTextSplitter` (800/100) |
+| LLM provider (primary) | Groq API | Remote inference; LPU hardware for low latency |
+| LLM model (default) | Meta Llama 3.1 8B Instant | Answer generation, summarisation, classification, metadata |
+| LLM provider (alternate) | Google Gemini | Swappable via env var |
+| LLM SDK (Groq) | OpenAI Python SDK | Groq's OpenAI-compatible interface |
+| LLM SDK (Gemini) | `google-genai` | Native Gemini client |
+| HTTP client | `requests` + `urllib3` | Outbound API calls with retry and connection pooling |
+| Configuration | `python-dotenv` | `.env` file loading |
+| Index serialisation | Python `pickle` (stdlib) | Chunk list and BM25 corpus persistence |
+| Version control | Git | Source control |
+
+---
+
+*Document reflects the current state of all source files: `app.py`, `config.py`, `search.py`, `llm.py`, `client.py`, `intent.py`, `prompt_enhancer.py`, `discovery.py`, `legal_structure.py`, `metadata_gen.py`, `ingest.py`, `ingest_caselaw.py`, `ingest_api.py`, `example .env`.*
